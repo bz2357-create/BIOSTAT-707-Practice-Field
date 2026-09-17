@@ -1,0 +1,616 @@
+---
+title: "BIOSTAT 707 — Checkpoint 1: Set A cohort preparation and description"
+author: "Bowen Zhang (bz147)"
+date: now
+engine: knitr
+format:
+  html:
+    toc: true
+    embed-resources: true
+execute:
+  echo: true
+  cache: false
+  error: false
+  warning: false
+  message: false
+---
+
+## Setup
+
+This checkpoint preserves the reproducible long table and adds measurement-quality and temporal missingness analyses. It also constructs the initial wide table, Table 1, and descriptive outcome summaries. No prediction model is fitted.
+
+```{r}
+#| label: setup
+here::i_am("checkpoint1.qmd")
+library(data.table)
+source(here::here("R", "load-set-a.R"))
+source(here::here("R", "audit-missingness.R"))
+source(here::here("R", "build-wide.R"))
+source(here::here("R", "informative-missingness.R"))
+library(ggplot2)
+# Confirm that all available package libraries belong to the Pixi environment.
+prefix <- normalizePath(Sys.getenv("CONDA_PREFIX"), mustWork = TRUE)
+stopifnot(all(startsWith(normalizePath(.libPaths()), paste0(prefix, "/"))))
+```
+
+## Data locations and reproducibility
+
+Run `pixi run --locked checkpoint1` from the repository root. The supplied
+`pixi.toml` and `pixi.lock` specify the environment; raw data and generated CSVs
+are excluded from Git. Set A must be supplied locally in `data/set-a/`.
+Neither raw patient files nor outcomes are downloaded by this pipeline.
+
+```{r}
+raw_dir <- here::here("data", "set-a")
+outcomes_path <- here::here("data", "Outcomes-a.txt")
+output_dir <- here::here("output")
+dir.create(output_dir, showWarnings = FALSE)
+cat("Outcomes-a.txt present:", file.exists(outcomes_path), "\n")
+```
+
+Outcomes are validated locally. Their values are preserved, including the special Survival sentinel.
+
+## What exists at prediction time?
+
+Set A contains ICU admission descriptors and time-stamped observations from the
+first 48 hours. These summaries would be available after that observation window,
+not at admission. In-hospital death is the later outcome. Length of stay and
+Survival also contain outcome information and are not predictors here.
+
+The [Challenge documentation](https://physionet.org/content/challenge-2012/1.0.0/)
+describes Event 1 as min(sensitivity, positive predictive value) and Event 2
+as a Hosmer–Lemeshow-based calibration criterion. Neither is calculated at this
+checkpoint because no prediction model has been fitted.
+
+## Import Set A
+
+All files must contain exactly `Time,Parameter,Value`. The loader reads these
+columns as text, validates numeric values and elapsed times, and verifies one
+internal RecordID per file against its filename. A malformed file stops the
+render with a file-specific error. It does not silently skip records.
+
+```{r}
+imported <- load_set_a(raw_dir)
+long <- imported$data
+knitr::kable(data.frame(example_filename = basename(imported$files[c(1,1001,2001,4000)])))
+```
+
+## Long-table construction
+
+Each source row is retained, including admission descriptors and the internal
+RecordID row. `RecordID` is an identifier stored as text. `Time` is the original
+elapsed-time string and `time_hours` is hours plus minutes divided by 60.
+`Value_raw` retains the original value text (including its decimal formatting);
+`Value` is numeric. Only numeric `-1` is changed to `NA` in `Value`.
+The [PhysioNet Challenge 2012 documentation](https://physionet.org/content/challenge-2012/1.0.0/)
+defines the elapsed-time convention and the missing/unknown sentinel.
+No aggregation, deduplication, imputation, or outlier removal is performed.
+
+```{r}
+knitr::kable(head(long, 10))
+```
+
+## Data integrity checks
+
+These checks execute before writing the CSV. Successful import means that all
+`r length(imported$files)` files passed schema, time, numeric-value, and internal-RecordID checks.
+
+```{r}
+required <- c("RecordID", "Time", "time_hours", "Parameter", "Value_raw", "Value")
+raw_numeric <- as.numeric(long$Value_raw)
+sentinel <- raw_numeric == -1
+stopifnot(length(imported$files) == 4000L,
+          !anyDuplicated(basename(imported$files)),
+          uniqueN(long$RecordID) == 4000L,
+          identical(names(long), required),
+          all(is.finite(long$time_hours)),
+          all(is.finite(raw_numeric)),
+          identical(is.na(long$Value), sentinel),
+          identical(long$Value[!sentinel], raw_numeric[!sentinel]),
+          long[Parameter == "RecordID", .N] == 4000L,
+          all(long[Parameter == "RecordID", Value_raw == RecordID]))
+validation <- data.table(
+  check = c("Source files", "Unique RecordIDs", "Total rows", "Columns",
+            "Filename/internal RecordID mismatches", "Schema/time/numeric parse failures",
+            "Minimum elapsed hours", "Maximum elapsed hours", "Rows below 0 hours",
+            "Rows above 48 hours", "Raw -1 values", "Cleaned NA values",
+            "Raw values below -1", "Unique Parameters"),
+  result = c(length(imported$files), uniqueN(long$RecordID), nrow(long), ncol(long),
+             0, 0, min(long$time_hours), max(long$time_hours),
+             sum(long$time_hours < 0), sum(long$time_hours > 48),
+             sum(sentinel), sum(is.na(long$Value)), sum(raw_numeric < -1),
+             uniqueN(long$Parameter)))
+knitr::kable(validation)
+parameter_counts <- long[, .(rows = .N), by = Parameter][order(Parameter)]
+knitr::kable(parameter_counts, caption = "All unique Parameters and their row counts")
+```
+
+### Write and verify the output
+
+`NA` is written explicitly in the cleaned numeric column. On import, specify
+text types for the identifier and original fields to preserve their formatting.
+The CSV is read back once, checking every column, row order, and numeric value
+(with tolerance for CSV floating-point serialization).
+
+```{r}
+csv_path <- here::here("output", "set-a_long.csv")
+fwrite(long, csv_path, na = "NA")
+stopifnot(file.exists(csv_path))
+roundtrip <- fread(csv_path, na.strings = "NA",
+                   colClasses = list(character = c("RecordID", "Time", "Parameter", "Value_raw"),
+                                     numeric = c("time_hours", "Value")))
+stopifnot(nrow(roundtrip) == nrow(long), uniqueN(roundtrip$RecordID) == 4000L,
+          identical(names(roundtrip), required))
+for (column in c("RecordID", "Time", "Parameter", "Value_raw")) {
+  stopifnot(identical(roundtrip[[column]], long[[column]]))
+}
+for (column in c("time_hours", "Value")) {
+  stopifnot(isTRUE(all.equal(roundtrip[[column]], long[[column]], tolerance = 1e-12)))
+}
+fwrite(validation, here::here("output", "validation-summary.csv"))
+fwrite(parameter_counts, here::here("output", "parameter-counts.csv"))
+cat("CSV read-back passed:", nrow(roundtrip), "rows x", ncol(roundtrip), "columns.\n")
+rm(roundtrip)
+```
+
+## Preliminary data-quality observations
+
+### Measurement validity and data-quality decisions
+
+The [PhysioNet variable definitions](https://physionet.org/content/challenge-2012/1.0.0/)
+provide non-negative values, specific categories, and some explicit bounds.
+SaO2 is a percentage, so its logical bounds are 0–100. These hard rules differ
+from an analyst's plausibility screen. I use a separate `long_analysis` copy;
+the six-column long CSV and both original value columns keep their Round 1 meaning.
+
+```{r}
+#| label: quality-audit
+quality <- audit_measurements(long)
+long_analysis <- quality$long
+stopifnot(setequal(unique(long$Parameter),
+                  c(time_series_parameters,"RecordID","Age","Gender","Height","ICUType")),
+          length(time_series_parameters)==37L)
+fwrite(quality$flags, here::here("output","data-quality-flags.csv"))
+fwrite(quality$summary, here::here("output","data-quality-summary.csv"))
+knitr::kable(quality$summary[flag_type=="hard",
+  .(Parameter, validity_rule, violations, example_values, treatment)],
+  caption="Documented hard validity rules (counts can overlap across rules)")
+knitr::kable(long_analysis[hard_invalid == TRUE,
+ .(observations=.N,patients=uniqueN(RecordID),values=paste(sort(unique(Value)),collapse=", ")),
+ by=Parameter],caption="Distinct hard-invalid observations by variable")
+```
+
+There are `r sum(long_analysis$hard_invalid)` distinct hard-invalid observations.
+Their `Value_analysis` is missing, but the rows, `Value_raw`, and `Value` remain.
+I did not insert decimal points into out-of-range pH values or try to reinterpret negative temperatures. The
+intended values cannot be recovered reliably from these records alone.
+The `r sum(is.na(long$Value))` original sentinel values also stay missing.
+
+### Soft plausibility concerns
+
+The Height screen of 100–250 cm is a broad analyst-defined review range, **not**
+an official validity range. Zero vital signs, weight, blood pressures, or PaO2
+may reflect patient condition, recording practice, or monitoring problems.
+They are flagged for review and still count as available measurements here.
+
+```{r}
+knitr::kable(quality$summary[flag_type=="soft",
+ .(Parameter,validity_rule,violations,example_values)],caption="Soft concerns; values retained")
+# Maxima are a rank-based inspection, not a threshold-based invalidity rule.
+maxima <- quality$summary[flag_type=="soft_extreme_review",
+ .(Parameter,rows_at_maximum=violations,maximum=example_values)]
+knitr::kable(maxima,caption="Positive maxima of continuous variables: exploratory review only")
+knitr::kable(head(quality$flags[flag_type %in% c("hard","soft"),
+ .(RecordID,Time,Parameter,Value_raw,flag_type,reason)],8),caption="Example flags")
+```
+
+The maxima table helps identify possible unit or scale issues without declaring
+that every maximum is wrong. The diagnostic CSV has one row per observation
+and flag reason; a source observation may have more than one flag. `source_row`
+identifies the corresponding row in the long table. No soft value is rescaled,
+winsorized, deleted, or imputed.
+
+## Missingness Analysis
+
+### Definition and admission descriptors
+
+A missing measurement often has **no row at all** in these skinny files.
+Counting `is.na(Value)` would miss those absences. I count a variable as measured
+when an admission has at least one nonmissing `Value_analysis` in the interval.
+Every proportion uses all `r uniqueN(long$RecordID)` admissions, including those with no rows for
+that variable. Hard-invalid values do not count; soft flags remain included.
+
+Admission descriptors use observations at `00:00`. A later Weight does not
+fill in a missing admission Weight. If multiple time-zero rows occur, at least
+one valid value establishes availability; choosing a single descriptor value
+is a later wide-table decision.
+
+```{r}
+ids <- sort(unique(long$RecordID))
+descriptors <- admission_availability(long_analysis,ids)
+fwrite(descriptors,here::here("output","admission-missingness.csv"))
+knitr::kable(descriptors[,.(Parameter,n_measured,n_missing,missing_percent=round(100*p_missing,2))])
+missingness <- measurement_availability(long_analysis,ids)
+availability <- missingness$overall
+temporal <- missingness$temporal
+halves <- missingness$halves
+fwrite(availability,here::here("output","availability-48h.csv"))
+fwrite(temporal,here::here("output","availability-6h.csv"))
+fwrite(halves,here::here("output","availability-24h-comparison.csv"))
+# Soft flags do not change availability; hard exclusions can change it.
+valid_rows <- long_analysis[Parameter %in% time_series_parameters,
+ .(explicit_missing_rows=sum(is.na(Value_analysis)))]
+cat("Explicit missing analysis rows among time-series rows:",valid_rows$explicit_missing_rows,"\n")
+any_row_pairs <- uniqueN(long_analysis[Parameter %in% time_series_parameters &
+ time_hours>=0 & time_hours<=48,.(RecordID,Parameter)])
+absent_pairs <- 4000L*37L-any_row_pairs
+total_missing_pairs <- sum(4000L-availability$n_measured)
+stopifnot(absent_pairs<=total_missing_pairs)
+knitr::kable(data.table(type=c("No row for admission-variable pair",
+ "Rows exist, but none has a valid analysis value"),
+ missing_pairs=c(absent_pairs,total_missing_pairs-absent_pairs)))
+
+```
+
+### Missingness over 48 hours
+
+These are admission-level percentages, not percentages of recorded rows.
+The 37 time-series variables include repeated Weight, but exclude RecordID,
+Age, Gender, Height, and ICUType. The raw names TroponinI and TroponinT correspond
+to TropI and TropT in the documentation.
+
+```{r}
+#| label: fig-overall-availability
+#| fig-width: 8
+#| fig-height: 10
+#| fig-cap: "Patients with at least one valid measurement during 0–48 hours. Denominator: all admissions for every variable."
+variable_order <- availability$Parameter
+plot_overall <- ggplot(availability,aes(x=p_measured,y=factor(Parameter,levels=variable_order)))+
+ geom_col(fill="#246987",width=.75)+
+ scale_x_continuous(labels=scales::label_percent(),limits=c(0,1),expand=expansion(mult=c(0,.01)))+
+ labs(x="Admissions with at least one valid measurement",y=NULL)+
+ theme_minimal(base_size=11)+theme(panel.grid.major.y=element_blank())
+ggsave(here::here("output","availability-48h.png"),plot_overall,width=8,height=10,dpi=160)
+plot_overall
+```
+
+```{r}
+knitr::kable(availability[,.(Parameter,n_measured,
+ measured_percent=round(100*p_measured,2),missing_percent=round(100*p_missing,2))])
+```
+
+### Temporal missingness
+
+Each heatmap cell is the proportion of `r length(ids)` admissions with at least one valid
+measurement, regardless of how many measurements that patient had in the bin.
+Bins are [0,6), [6,12), ..., [36,42), and [42,48]. Thus a reading at 06:00 starts
+the second bin and 48:00 belongs to the last bin. Empty variable/bin cells
+are explicitly included with zero availability.
+
+```{r}
+#| label: fig-temporal-availability
+#| fig-width: 10
+#| fig-height: 11
+#| fig-cap: "Six-hour measurement availability. Rows are 37 time-series variables; columns are time windows; fill is the proportion of all admissions with a valid measurement."
+bin_labels <- c("0–6","6–12","12–18","18–24","24–30","30–36","36–42","42–48")
+plot_temporal <- ggplot(temporal,aes(x=factor(bin,levels=1:8,labels=bin_labels),
+ y=factor(Parameter,levels=variable_order),fill=p_measured))+
+ geom_tile(color="white",linewidth=.25)+
+ scale_fill_viridis_c(limits=c(0,1),labels=scales::label_percent(),name="Admissions\nmeasured")+
+ labs(x="Hours after ICU admission (48:00 included in final bin)",y=NULL)+
+ theme_minimal(base_size=11)+theme(panel.grid=element_blank())
+ggsave(here::here("output","availability-6h-heatmap.png"),plot_temporal,width=10,height=11,dpi=160)
+plot_temporal
+```
+
+### First 24 versus second 24 hours
+
+The first window is [0,24); the second is [24,48], including 48:00. These windows
+do not overlap. Differences below are second minus first, in percentage points.
+
+```{r}
+half_display <- merge(availability[,.(Parameter,n_measured)],halves,by="Parameter")
+setorder(half_display,n_measured,Parameter)
+knitr::kable(half_display[,.(Parameter,first_percent=round(100*p_first,2),
+ second_percent=round(100*p_second,2),difference_pp=round(difference_pp,2))])
+largest_changes <- halves[order(-abs(difference_pp))][1:5]
+knitr::kable(largest_changes[,.(Parameter,first_percent=round(100*p_first,2),
+ second_percent=round(100*p_second,2),difference_pp=round(difference_pp,2))],
+ caption="Five largest absolute changes between the two windows")
+```
+
+### Interpretation
+
+Over 48 hours, availability ranges from `r round(100*min(availability$p_measured),1)`%
+to `r round(100*max(availability$p_measured),1)`%. `r paste(tail(availability$Parameter,3),collapse=", ")`
+are among the most routinely recorded variables, while
+`r paste(head(availability$Parameter,3),collapse=", ")` are much less frequently
+recorded. This is consistent with some tests being ordered selectively,
+although these data alone do not establish why a test was ordered.
+
+The largest absolute change between the first and second windows is for
+`r largest_changes$Parameter[1]`: `r round(100*largest_changes$p_first[1],1)`%
+to `r round(100*largest_changes$p_second[1],1)`%. Measurement availability
+can change over the ICU window. I would keep first- and second-24-hour summaries
+separate in the initial wide-table design so this timing is not lost.
+This is a provisional data-summary choice, not a modeling decision.
+
+Missingness here is largely the absence of measurements, rather than explicit
+NA rows. Measurement patterns may reflect clinical workflow or patient
+condition, so I would not automatically assume MCAR. This audit does not prove
+MNAR or a causal explanation. These figures describe whether a measurement
+exists, not how often it was repeated or whether it is clinically plausible.
+
+## Outcome-file validation
+
+The submitted pipeline reads the grader-provided `data/Outcomes-a.txt` and
+contains no download step.
+
+```{r}
+outcomes <- fread(outcomes_path,colClasses=list(character="RecordID"),check.names=FALSE)
+validate_outcomes(outcomes,ids)
+outcome_validation <- data.table(rows=nrow(outcomes),unique_RecordIDs=uniqueN(outcomes$RecordID),
+ matched_RecordIDs=sum(outcomes$RecordID %in% ids),
+ in_hospital_deaths=sum(outcomes[["In-hospital_death"]]),
+ death_proportion=mean(outcomes[["In-hospital_death"]]))
+knitr::kable(outcome_validation)
+fwrite(outcome_validation,here::here("output","outcome-validation.csv"))
+```
+
+No blanket `-1` conversion is applied to outcomes. In particular, Survival
+records days to a recorded death; `-1` indicates a survivor under the Challenge
+definition. The primary outcome is the supplied `In-hospital_death`, not a
+reconstruction from Survival. Field-specific handling for descriptive summaries is explained below; the
+original outcome values remain unchanged.
+
+## Wide-table design
+
+Round 2 showed substantial differences in measurement availability between the
+first and second 24 hours. I therefore keep [0,24) and [24,48] separate while
+creating one row per admission. Exactly 24:00 and 48:00 belong to the second
+window; 00:00 belongs to the first. Every in-range observation has one window.
+
+For each of the 37 variables in each window, count records the number of valid
+observations. First and last retain some ordering information, min/max describe
+the observed range, and mean gives the average recorded level. First/last use
+time followed by source order for ties. These are summaries of the observed
+measurements, not time-weighted averages. All valid tied observations contribute
+to count/min/max/mean. This is an initial design that can be revised later,
+not a claim that these are optimal model features.
+
+Numerical summaries use `Value_analysis`: sentinel missing values and the `r sum(long_analysis$hard_invalid)`
+hard-invalid observations are excluded; soft concerns remain. There is no
+imputation, rescaling, or winsorization. A window with no valid measurements
+has count 0 and NA for all five numerical summaries.
+
+### Descriptor and timestamp audits
+
+Admission descriptors use time zero only. A missing admission Weight is never
+replaced by a later Weight. Both AdmissionWeight and repeated Weight summaries
+are intentionally retained because Weight has both roles in the source data.
+Identical descriptor duplicates would collapse to the first source row;
+inconsistent duplicates stop construction for review rather than choosing a
+value silently. Missing source rows would remain NA and appear in the audit.
+
+```{r}
+#| label: build-wide
+built <- build_wide(long_analysis,ids,outcomes)
+wide <- built$wide
+descriptor_audit <- built$descriptor_audit
+dup <- built$duplicates
+fwrite(descriptor_audit,here::here("output","descriptor-extraction-audit.csv"))
+fwrite(dup,here::here("output","duplicate-timestamp-audit.csv"))
+descriptor_summary <- descriptor_audit[,.(expected_pairs=.N,
+ missing_source_rows=sum(source_rows==0),duplicate_pairs=sum(source_rows>1),
+ inconsistent_pairs=sum(distinct_values>1),minimum_rows=min(source_rows),
+ maximum_rows=max(source_rows)),by=Parameter]
+knitr::kable(descriptor_summary)
+dup_summary <- data.table(duplicate_groups=nrow(dup),
+ rows_in_duplicate_groups=sum(dup$rows),extra_rows=sum(dup$rows-1L),
+ conflicting_valid_groups=sum(dup$valid_distinct>1))
+knitr::kable(dup_summary)
+```
+
+The audit found `r nrow(dup)` duplicated patient/parameter/exact-Time groups;
+`r sum(dup$valid_distinct>1)` contain conflicting valid values. Source order
+makes first/last deterministic without averaging away those disagreements.
+The raw observations stay intact in the long table.
+
+## Wide-table construction and validation
+
+Columns are RecordID, five admission descriptors, `r length(feature_columns())` time-series summaries,
+and five outcome fields: **`r ncol(wide)` columns**. The summaries follow the fixed
+37-variable order, first window then second window, and count/first/last/min/max/mean.
+For example, `HR_h0_24_mean` and `HR_h24_48_count` identify the variable,
+window, and statistic. `SAPS-I` is renamed `SAPS_I`, and `In-hospital_death` becomes `In_hospital_death`. Other outcome
+names and values remain unchanged, including all raw outcome `-1` codes.
+
+```{r}
+wide_path <- here::here("output","set-a_wide.csv")
+validate_wide(wide,ids,outcomes)
+fwrite(wide,wide_path,na="NA")
+wide_read <- fread(wide_path,na.strings="NA",colClasses=list(character="RecordID"))
+validate_wide(wide_read,ids,outcomes)
+stopifnot(isTRUE(all.equal(wide_read,wide,tolerance=1e-12,check.attributes=FALSE)))
+knitr::kable(data.table(rows=nrow(wide_read),columns=ncol(wide_read),
+ expected_columns=455,unique_RecordIDs=uniqueN(wide_read$RecordID),
+ time_series_columns=length(feature_columns())))
+```
+
+Validation includes unique matching IDs, a one-to-one outcome join, unique
+column names, no Inf/-Inf/NaN, non-negative integer counts, and the correspondence
+between zero counts and five missing summaries. First/last use valid observations
+only. Checks also confirm that mean lies between min and max.
+
+`In_hospital_death` is the target. Length_of_stay and Survival contain
+post-admission outcome information and must not become prediction features.
+SAPS_I and SOFA are retained for cohort description/evaluation; they are not
+automatically future predictors merely because they appear in this CSV.
+
+## Wide-table missingness
+
+This figure is calculated **from the read-back wide CSV**. Count is always
+observed; count 0 means that first/last/min/max/mean are all missing for that
+variable-window. If count is positive, all five are observed. Those five
+summaries therefore share a missingness pattern, so plotting each separately
+would repeat the same information. The fill here is missingness, whereas
+Round 2's figures show availability.
+
+```{r}
+#| label: fig-wide-missingness
+#| fig-width: 7
+#| fig-height: 10
+#| fig-cap: "Missingness derived from set-a_wide.csv: percentage of all admissions with count zero in each variable-window."
+wide_missing <- wide_missingness(wide_read)
+# Independently connect the new wide representation to the validated Round 2 counts.
+check_half <- merge(wide_missing,halves,by="Parameter")
+stopifnot(all(abs(check_half$p_missing-ifelse(check_half$window=="h0_24",
+ 1-check_half$p_first,1-check_half$p_second))<1e-12))
+fwrite(wide_missing,here::here("output","wide-missingness.csv"))
+plot_wide <- ggplot(wide_missing,aes(x=factor(window,levels=window_names,
+ labels=c("0–24 h","24–48 h")),y=factor(Parameter,levels=variable_order),fill=p_missing))+
+ geom_tile(color="white",linewidth=.35)+
+ scale_fill_viridis_c(limits=c(0,1),labels=scales::label_percent(),name="Admissions\nmissing")+
+ labs(x="Time window ([0,24) and [24,48])",y=NULL)+
+ theme_minimal(base_size=11)+theme(panel.grid=element_blank())
+ggsave(here::here("output","wide-missingness.png"),plot_wide,width=7,height=10,dpi=160)
+plot_wide
+```
+
+### Admission-descriptor missingness from the wide table
+
+```{r}
+wide_descriptors <- c("Age","Gender","Height","ICUType","AdmissionWeight")
+wide_descriptor_missing <- rbindlist(lapply(wide_descriptors,function(p)
+ data.table(descriptor=p,missing_N=sum(is.na(wide_read[[p]])),
+ missing_percent=100*mean(is.na(wide_read[[p]])))))
+fwrite(wide_descriptor_missing,here::here("output","wide-descriptor-missingness.csv"))
+knitr::kable(wide_descriptor_missing,digits=3)
+```
+
+## Table 1
+
+Table 1 describes admission characteristics, stratified by the supplied
+in-hospital death indicator. Continuous variables use median (Q1, Q3), and
+categories use n (%) among nonmissing values within each column. Missing counts
+are shown separately. There are no hypothesis-test p-values. Documented invalid
+values are missing in analysis; broader plausibility flags remain because there
+is not enough evidence to correct or remove them.
+
+```{r}
+#| label: table-one
+#| echo: false
+table_data <- as.data.frame(wide_read[,c(wide_descriptors,"In_hospital_death"),with=FALSE])
+table_data$Gender <- factor(table_data$Gender,levels=c(0,1),labels=c("Female","Male"))
+table_data$ICUType <- factor(table_data$ICUType,levels=1:4,
+ labels=c("Coronary Care Unit","Cardiac Surgery Recovery Unit","Medical ICU","Surgical ICU"))
+table_data$In_hospital_death <- factor(table_data$In_hospital_death,levels=c(0,1),labels=c("Survived","Died"))
+table1 <- gtsummary::tbl_summary(table_data,by=In_hospital_death,
+ type=list(c(Age,Height,AdmissionWeight)~"continuous",c(Gender,ICUType)~"categorical"),
+ statistic=list(gtsummary::all_continuous()~"{median} ({p25}, {p75})",
+                gtsummary::all_categorical()~"{n} ({p}%)"),
+ digits=list(gtsummary::all_continuous()~1,gtsummary::all_categorical()~c(0,1)),
+ label=list(Age~"Age (years)",Gender~"Gender",Height~"Height (cm)",
+ ICUType~"ICU type",AdmissionWeight~"Admission weight (kg)"),
+ missing="always",missing_text="Missing",missing_stat="{N_miss}") |>
+ gtsummary::add_overall(last=FALSE) |>
+ gtsummary::modify_caption("**Table 1. Admission characteristics by in-hospital outcome**") |>
+ gtsummary::bold_labels()
+fwrite(as.data.table(gtsummary::as_tibble(table1)),here::here("output","table1.csv"))
+gtsummary::as_gt(table1)
+```
+
+Category labels follow the [official PhysioNet definitions](https://physionet.org/content/challenge-2012/1.0.0/).
+The admission Weight column is independent of later repeated Weight summaries.
+
+## Outcome summary
+
+```{r}
+cohort_totals <- data.table(total_admissions=nrow(wide_read),
+ survived=sum(wide_read$In_hospital_death==0),died=sum(wide_read$In_hospital_death==1),
+ mortality_percent=100*mean(wide_read$In_hospital_death==1))
+stopifnot(cohort_totals$survived+cohort_totals$died==4000L)
+knitr::kable(cohort_totals,digits=2)
+severity <- outcome_description(wide_read)
+fwrite(severity,here::here("output","outcome-descriptive-summary.csv"))
+fwrite(cohort_totals,here::here("output","cohort-totals.csv"))
+knitr::kable(severity[,.(field,nonmissing_N,missing_N,
+ `Median (Q1, Q3)`=sprintf("%.1f (%.1f, %.1f)",median,q1,q3))])
+```
+
+For this table only, the documented missing/unknown code `-1` in SAPS_I, SOFA,
+and Length_of_stay is treated as missing in separate copies. Their raw values
+remain in the wide CSV. Length of stay describes the hospitalization rather
+than a baseline characteristic. Survival is omitted from this numerical table:
+its `-1` has special survivor semantics and is not an ordinary number of days.
+Mortality comes directly from In_hospital_death.
+
+## Is the missingness informative?
+
+For each time-series variable, an admission is ever measured when it has at
+least one valid `Value_analysis` during 0–48 hours, including both endpoints.
+Sentinels and hard-invalid values do not count; soft flags remain included.
+Each admission contributes once to either the measured or unmeasured group.
+Death rates use the supplied in-hospital outcome. Differences below are signed
+percentage points (measured minus unmeasured), sorted by absolute magnitude.
+An unavailable rate is shown as NA when its group is empty.
+
+```{r}
+informative <- informative_missingness(long_analysis, ids, outcomes)
+stopifnot(all(informative$n_measured + informative$n_not_measured == length(ids)),
+          all(informative$deaths_measured + informative$deaths_not_measured ==
+              sum(outcomes[["In-hospital_death"]])))
+availability_check <- merge(informative, availability, by="Parameter")
+stopifnot(all(availability_check$n_measured.x == availability_check$n_measured.y))
+fwrite(informative, here::here("output", "informative-missingness.csv"), na="NA")
+knitr::kable(informative[, .(Variable=Parameter, `Measured N`=n_measured,
+ `Measured death %`=death_pct_measured, `Not measured N`=n_not_measured,
+ `Not measured death %`=death_pct_not_measured,
+ `Difference (pp)`=difference_pp)], digits=2)
+```
+
+Across the `r nrow(informative)` variables, mortality differs between measured
+and unmeasured groups for some variables. Whether a measurement is taken may
+reflect patient condition and clinical workflow, so I would not automatically
+treat measurement absence as random. Small unmeasured groups can also produce
+large, unstable differences. This descriptive comparison does not establish why
+measurements are missing, establish causality, or prove a formal missingness
+mechanism. The ordering is only a way to display the table; no hypothesis tests
+or p-values are used.
+
+## AI use disclosure
+
+I used Codex/ChatGPT substantially for project and repository setup guidance,
+R code drafting, data wrangling, missingness analysis, wide-table construction,
+tests and assertions, debugging Pixi and Quarto, explaining statistical and
+data concepts, and identifying edge cases to review.
+
+The assistance reduced repetitive coding work, suggested useful checks, exposed
+edge cases, and helped explain unfamiliar tooling. It also introduced risks:
+AI can make unjustified clinical assumptions, and code can run successfully
+while implementing the wrong data definition. The initial AI-assisted audit
+missed some invalid pH values until a broader audit. Environment fixes also
+became unnecessarily complicated during development. These experiences made
+checking the definitions and outputs necessary.
+
+The review process used reproducible tests, raw-record spot checks, and separate
+calculations, including independent Python calculations for selected summaries.
+Checks covered source-file counts and schemas, filename/internal RecordID
+agreement, preservation of raw values, the distinction between hard-invalid
+values and soft flags, boundaries at 24:00 and 48:00, long-to-wide spot checks,
+and outcome joins. Figures were visually inspected. Locked Pixi execution and
+a final fresh-clone reproduction were used to check reproducibility and compare
+the long and wide CSV hashes with the accepted baseline.
+
+Many checks were themselves developed or run with AI assistance; this is not
+independent human validation of every generated line. Automated checks and
+separate calculations can expose mistakes, but do not replace my responsibility
+to personally read the final report and confirm that this disclosure accurately
+reflects my work before submitting.
+
+## Session information
+
+```{r}
+#| label: session-information
+sessioninfo::session_info()
+```
