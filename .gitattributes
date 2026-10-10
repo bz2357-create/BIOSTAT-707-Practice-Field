@@ -1,0 +1,2 @@
+# Quarto embeds upstream CSS/JavaScript with trailing spaces. Preserve render bytes.
+output/checkpoint2.html whitespace=-blank-at-eol

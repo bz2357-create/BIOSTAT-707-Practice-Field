@@ -4,3 +4,12 @@ output/*
 .pixi/
 checkpoint1_files/
 .Rhistory
+!output/checkpoint2.html
+!output/checkpoint3.html
+checkpoint2_files/
+
+/.quarto/
+**/*.quarto_ipynb
+checkpoint2.rmarkdown
+checkpoint2.knit.md
+checkpoint2.utf8.md

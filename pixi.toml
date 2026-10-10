@@ -21,6 +21,28 @@ r-here = "*"
 r-readr = "*"
 python = "3.12.*"
 pandas = "*"
+r-tidyverse = ">=2.0.0,<3"
+r-glmnet = ">=5.0,<6"
+r-mgcv = ">=1.9_4,<2"
+r-ranger = ">=0.18.0,<0.19"
+r-proc = ">=1.19.1,<2"
 
 [tasks]
 checkpoint1 = "quarto render checkpoint1.qmd --output-dir output"
+checkpoint2 = "quarto render checkpoint2.qmd --output-dir output"
+
+[activation.env]
+OPENBLAS_NUM_THREADS = "1"
+OMP_NUM_THREADS = "1"
+VECLIB_MAXIMUM_THREADS = "1"
+MKL_NUM_THREADS = "1"
+R_LIBS_USER = ""
+
+[target.osx-arm64.activation]
+scripts = ["scripts/activate-quarto.sh"]
+
+[target.osx-64.activation]
+scripts = ["scripts/activate-quarto.sh"]
+
+[target.linux-64.activation]
+scripts = ["scripts/activate-quarto.sh"]

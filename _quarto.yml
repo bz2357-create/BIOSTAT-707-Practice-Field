@@ -1,0 +1,9 @@
+# A genuine default project prevents standalone --output-dir from clearing
+# existing CP1 artifacts. Keep each instructor task limited to its named report.
+project:
+  type: default
+  output-dir: output
+  execute-dir: project
+  render:
+    - checkpoint1.qmd
+    - checkpoint2.qmd

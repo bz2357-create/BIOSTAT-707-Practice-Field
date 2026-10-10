@@ -1,0 +1,665 @@
+---
+title: "BIOSTAT 707 — Checkpoint 2: Mortality models on Set A"
+author: "Bowen Zhang (bz147)"
+engine: knitr
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    embed-resources: true
+    code-fold: true
+execute:
+  echo: false
+  cache: false
+  error: false
+  warning: true
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(data.table)
+setDTthreads(1)
+library(ggplot2)
+prefix <- normalizePath(Sys.getenv('CONDA_PREFIX'),mustWork=TRUE)
+stopifnot(startsWith(normalizePath(R.home()),paste0(prefix,'/')),
+ all(startsWith(normalizePath(.libPaths()),paste0(prefix,'/'))))
+for (helper in c('load-set-a','audit-missingness','build-wide','cp2-data',
+                 'cp2-preprocess','cp2-models','cp2-run','cp2-plots')) source(paste0('R/',helper,'.R'))
+# No generated CP1 or prior CP2 table is an input to this render.
+result <- cp2_run()
+plots <- cp2_make_plots(result)
+d <- result$data
+comparison <- result$comparison
+fmt <- function(x,digits=3) formatC(x,format='f',digits=digits)
+tab <- function(x,...) knitr::kable(x,...)
+```
+
+## AI-use statement
+
+I used ChatGPT to plan the modeling and
+validation design. I used OpenAI Codex to write and debug the R/Quarto/Pixi
+workflow, run analyses and automated checks, inspect figures, and help draft
+explanatory text. Automated checks examined data integrity, training-only
+preprocessing, cross-validation partitions, event coding, saved predictions,
+and reproducible execution. AI accelerated implementation and repeatable testing,
+but generated code required debugging. A rendering operation unexpectedly removed
+generated output; the submitted CP1 HTML was restored exactly from Git, and
+supporting outputs were regenerated with the recorded long/wide hashes checked.
+The complete original supporting-output manifest was lost, so full byte-for-byte
+restoration of those files cannot be established. The later audit also identified
+unstable generalized additive model (GAM) predictions caused by sparse-category
+separation. Detailed technical
+evidence is recorded in `docs/cp2-verification.md` and `docs/cp2-final-qa.md`.
+These automated checks do not establish clinical validity, causality, or
+independent external validation.
+
+## 2.1 Modeling table and cleaning
+
+The [PhysioNet/Computing in Cardiology Challenge 2012 dataset](https://physionet.org/content/challenge-2012/1.0.0/)
+contains intensive care unit (ICU) stays with observations over the first 48 hours.
+This analysis uses **Set A only**, with one row per stay. The two windows are
+columns: [0,24) and [24,48], so 24:00 begins the second window and 48:00 is included.
+All predictors become available only after this 48-hour observation window;
+this is not an admission-time prediction system.
+
+```{r}
+#| label: cohort
+cohort <- data.table(stays=nrow(d$wide),wide_columns=ncol(d$wide),
+ deaths=sum(d$y),death_percent=100*mean(d$y),unique_ids=uniqueN(d$ids))
+tab(cohort,digits=2,caption='Table 1. Reconstructed Set A modeling cohort.')
+```
+
+The reconstructed table has `r nrow(d$wide)` stays and `r ncol(d$wide)` columns,
+including `r sum(d$y)` deaths (`r fmt(100*mean(d$y),2)`%). The death indicator is
+joined one-to-one by RecordID: source `In-hospital_death` maps to
+`In_hospital_death`, with 1 meaning death. Checks require complete binary outcomes,
+unique nonmissing IDs, equal patient/outcome ID sets, exact column names,
+0–48-hour source times and consistent summary counts. A malformed stay or conflicting
+admission descriptor stops construction.
+
+The pipeline reconstructs the wide table directly from `data/set-a/` and
+`data/Outcomes-a.txt`. It uses CP1 sentinel (`-1`) handling and hard-invalid
+rules in a copied analysis column, preserving original Value and Value_raw.
+Hard-invalid rules include negative nonmissing measurements, invalid categorical
+codes, and documented bounds for Glasgow Coma Score (GCS), inspired oxygen
+fraction, oxygen saturation and pH. CP1 soft zero/extreme flags are retained
+unless covered by the prespecified CP2 revision below. Positive maxima are
+review flags, not global deletion or winsorization thresholds.
+
+```{r}
+#| label: cleaning-summary
+cleaning_counts <- data.table(rule=c('CP1 hard-invalid records','CP1 sentinel -1 records',
+ 'CP2 zero-height records','CP2 zero-weight records'),
+ records=c(d$source_summary$hard_invalid,d$source_summary$sentinel_missing,
+ sum(d$cleaning$Parameter=='Height'),sum(d$cleaning$Parameter=='Weight')))
+tab(cleaning_counts,caption='Table 2. Record-level cleaning counts; different rules may overlap.')
+```
+
+CP1 hard-invalid cleaning affects `r d$source_summary$hard_invalid` records.
+CP2 additionally sets `r sum(d$cleaning$Parameter=='Weight')` zero-weight and
+`r sum(d$cleaning$Parameter=='Height')` zero-height records to missing because
+zero body size is not usable. This happens before admission extraction and
+window aggregation, so repeated Weight values and valid counts change too.
+Other soft flags stay unchanged. Exact changed records, CP1 flags and admission
+extraction audits are saved under `output/cp2_*.csv`; CP1 source and generated
+results are preserved.
+
+## 2.2 Predictors and eligibility
+
+A positive allowlist supplies **`r length(cp2_predictors())` candidate raw
+predictors** to elastic net and random forest: five admission descriptors and
+`r length(feature_columns())` summaries (37 variables × two windows × six statistics).
+The joined table's 455 columns are not 455 predictors. RecordID, either target
+spelling, length of stay, survival, Simplified Acute Physiology Score I (SAPS-I)
+and Sequential Organ Failure Assessment (SOFA) are excluded from every model.
+Benchmark scores are held in a separate evaluation object.
+
+Gender uses documented categories 0 = female, 1 = male; ICUType uses 1 = coronary
+care, 2 = cardiac surgery recovery, 3 = medical ICU, 4 = surgical ICU. Both are
+categorical. The dictionary abbreviations are coronary care unit (CCU), cardiac
+surgery recovery unit (CSRU), medical intensive care unit (MICU), and surgical
+intensive care unit (SICU). Liver enzyme abbreviations are alkaline phosphatase
+(ALP), alanine aminotransferase (ALT), and aspartate aminotransferase (AST).
+Other source labels are heart rate (HR), temperature (Temp), respiratory rate
+(RespRate), mean arterial pressure (MAP), blood urea nitrogen (BUN), and white
+blood cell count (WBC). Arterial blood pressure (ABP) uses diastolic (DiasABP)
+and systolic (SysABP) labels; NI prefixes identify non-invasive measurements
+(NIDiasABP, NIMAP, NISysABP). FiO2 is the inspired oxygen fraction; HCO3 is
+bicarbonate; HCT is hematocrit; PaCO2 and PaO2 are arterial carbon-dioxide and
+oxygen partial pressures; SaO2 is arterial oxygen saturation; MechVent denotes
+mechanical ventilation documentation. Unit IU/L means international units per
+liter. A count of zero means no valid measurement, not a measured laboratory
+value of zero. Counts can reflect monitoring, treatment decisions and patient
+condition; associations are not intervention effects.
+
+```{r}
+#| label: predictor-groups
+raw_groups <- result$dictionary[model_pool=='Elastic net / forest',
+ .(raw_candidates=.N,rationale=rationale[1]),by=group]
+encoded_parent <- sub('__.*$','',result$full$enet$preprocess$columns)
+encoded_group <- result$dictionary$group[match(encoded_parent,result$dictionary$predictor)]
+encoded_counts <- as.data.table(table(encoded_group));setnames(encoded_counts,c('group','encoded_retained'))
+groups <- merge(raw_groups,encoded_counts,by='group',all.x=TRUE)
+groups[is.na(encoded_retained),encoded_retained:=0]
+tab(groups,caption='Table 3. Broad predictor groups and retained full-data encoded columns.')
+```
+
+The full-data broad design retains `r length(result$full$enet$preprocess$columns)`
+encoded columns. Group counts show the effects of categorical dummy coding and
+training-only usability removal; eligibility is otherwise prespecified. No
+outcome-driven screening or rare-measurement threshold is used.
+
+<details>
+<summary>Complete predictor dictionary: names, windows, definitions and units</summary>
+
+```{r}
+#| label: predictor-dictionary
+tab(result$dictionary[,.(predictor,group,window,definition,unit)],
+ caption='Table 4. All 449 broad candidates plus the GAM-only documentation indicator.')
+```
+
+Each name identifies its source, window and statistic; count units are records,
+while value summaries keep the original measurement units. TroponinI/TroponinT
+are the source-file names corresponding to TropI/TropT in the official definitions.
+The additional documentation indicator is GAM-only.
+
+</details>
+
+Within each relevant training partition, a numeric value column is removed if
+100% missing; other encoded columns are removed if their sample standard
+deviation is zero after training imputation. Useful nonconstant counts remain
+even when value summaries are removed. There is no arbitrary rarity cutoff.
+
+```{r}
+#| label: dropping-summary
+drop_summary <- result$drops[,.(columns_removed=.N),by=.(context,family,reason)]
+tab(drop_summary,caption='Table 5. Outer/full-refit column removals under the fixed usability rules.')
+```
+
+The table reports removal counts by fit; actual column names and reasons follow
+below and are saved in `cp2_dropped_columns.csv`. Inner-partition states and all
+inner removals are also saved in `cp2_preprocessing_audit.rds`.
+
+<details>
+<summary>Exact columns removed in each outer fit and full-data refit</summary>
+
+```{r}
+#| label: dropped-columns
+tab(result$drops[,.(context,family,column,reason)],caption='Table 6. Exact dropped columns.')
+```
+
+These are training-specific unusable columns, not predictors judged unimportant
+from held-out performance.
+
+</details>
+
+## 2.3 Cross-validation and preprocessing
+
+Cross-validation (CV) uses five stratified outer folds by stay, seed **7072026**.
+IDs are sorted before seeded assignment; all methods use the identical persisted
+outer assignment. Every stay receives exactly one out-of-fold (OOF) probability
+from each learned model. The untouched outer fold is predicted only after tuning
+and refitting within its outer-training partition.
+
+Elastic net and forest use three stratified inner folds within each outer-training
+partition, with seeds 7072026 + outer-fold number. Inner splits are shared across
+families and settings. The GAM's fixed formula uses restricted maximum likelihood
+(REML) smoothness estimation on outer training; it has no separate CV grid.
+
+```{r}
+#| label: fold-layout
+fold_layout <- result$oof[,.(stays=.N,deaths=sum(outcome),death_percent=100*mean(outcome)),by=outer_fold]
+tab(fold_layout,digits=2,caption='Table 7. Common outer-fold layout.')
+```
+
+Every fold contains deaths and survivors. Each validation stay is excluded from
+both its outer-training fit and all associated inner folds; the checks also
+verify complete, nonoverlapping assessment coverage.
+
+Preprocessing is fitted separately in **every inner training split**, again on
+the whole outer-training partition after tuning, and finally on all Set A for
+refits. Numeric measurements use training medians. For each categorical predictor,
+training-observed categories define the levels, plus a missing level when training
+has missing values. Missing/unseen categories map to that missing level if present;
+otherwise they map to the training mode (ties choose the lowest code). Dummy coding
+omits the first training-observed level as reference. These rules never learn levels
+from validation data and never silently discard rows.
+
+Elastic net explicitly centers and scales every retained column, including binary
+and dummy columns, by training mean and sample standard deviation. `glmnet` then
+uses `standardize = FALSE`; its coefficients are therefore on this explicit standard deviation (SD)
+scale. GAM and forest retain original measurement units. GAM counts are prespecified
+`log1p(count)` parametric terms. Counts are complete measurements of record frequency,
+not missing values needing imputation.
+
+Area under the receiver operating characteristic curve (AUROC) always defines
+1 = death and larger probability/severity score = greater risk. No automatic receiver operating characteristic (ROC)
+direction selection is used. The main summary is the unweighted mean and sample
+standard deviation (SD) of five fold AUROCs. The OOF ROC plot also reports pooled
+AUROC, which is a different summary.
+
+Nested tuning limits hyperparameter-selection leakage. **Choosing the winning
+family using the same outer-CV results can still make its reported performance
+optimistic**. This is internal evaluation, not independent external validation.
+
+## 2.4 Model 1: Elastic-net logistic regression
+
+Binomial elastic net uses fixed alpha = 0.5, a compromise between sparse selection
+and shrinkage of correlated summaries. Lambda is tuned over 30 descending
+log-spaced values from 1 to 0.0001. Selection maximizes mean inner-fold AUROC;
+ties within `1e-10` favor the larger lambda. The complete fixed path is fitted
+with 100,000 maximum passes; convergence and path coverage are checked. The grid
+is not expanded in response to outer-fold scores.
+
+```{r}
+#| label: enet-tuning
+tab(result$hyperparameters[family=='enet',.(context,design_p,lambda,boundary)],digits=6,
+ caption='Table 8. Chosen elastic-net penalties and boundary selections.')
+```
+
+The all-Set-A interpretation fit uses lambda
+`r fmt(result$full$enet$hyperparameters$lambda,6)`, selected using fresh three-fold
+CV on all Set A (seed 7072926). Boundary selections are explicitly reported above.
+Full tuning results are saved in `cp2_tuning_enet.csv`.
+
+```{r}
+#| label: fig-coefficients
+#| fig-width: 9
+#| fig-height: 8
+#| fig-cap: "Largest standardized elastic-net coefficients in the all-Set-A fit."
+plots$coefficient
+```
+
+The fit retains `r sum(result$coefficients$retained)` nonzero design coefficients
+using tolerance `1e-8`; the figure shows the 25 largest absolute coefficients,
+excluding the intercept. A coefficient is the conditional log-odds change per
+training SD of its encoded predictor. For a dummy, one SD is not a complete
+category change. The largest absolute coefficient belongs to
+`r result$coefficients[order(-abs(standardized_coefficient)),predictor][1]`.
+These are predictive associations, not causal effects or biological discoveries.
+
+```{r}
+#| label: fig-stability
+#| fig-width: 9
+#| fig-height: 8
+#| fig-cap: "Predictor retention across the five outer-training elastic-net fits."
+plots$stability
+```
+
+`r sum(result$stability$retained_folds==5)` predictors are retained in all five outer
+fits; `r sum(result$stability$retained_folds>0)` appear in at least one. The figure
+shows the 25 highest-frequency predictors, breaking display ties by absolute
+full-fit coefficient. Correlated first/last/extreme/window summaries can substitute
+for each other, so unstable selection need not imply an absent biological
+association. Ordinary elastic net does not enforce selection of a whole factor.
+
+<details>
+<summary>All encoded coefficients and retention in each outer fold</summary>
+
+```{r}
+#| label: full-coefficients
+tab(result$stability[,.(predictor,standardized_coefficient,retained,
+ fold_1,fold_2,fold_3,fold_4,fold_5,frequency)],digits=5,
+ caption='Table 9. Full coefficient table and outer-fold retention; absent fold columns count as unretained.')
+```
+
+The complete table makes truncation in both figures explicit and allows checking
+whether full-fit retained predictors recur across folds. No post-selection Wald
+intervals are supplied.
+
+</details>
+
+## 2.5 Model 2: Logistic GAM
+
+The GAM uses 17 clinically prespecified source variables, rather than features
+selected using every validation label: age, Gender, ICUType, second-window mean
+heart rate, temperature, mean arterial pressure (MAP) and respiratory rate; minimum
+GCS; last creatinine, blood urea nitrogen (BUN), white blood cell count (WBC),
+platelets and lactate; documented mechanical ventilation; and MAP, creatinine and
+lactate counts. This represents demographics, observed physiology, labs, treatment
+documentation and monitoring intensity. It does not assert 17 independent causal
+risk factors.
+
+```{r}
+#| label: gam-inputs
+tab(result$dictionary[match(cp2_gam_variables,predictor),.(predictor,window,unit,rationale)],
+ caption='Table 10. Prespecified GAM source-variable set.')
+```
+
+Categorical terms use the same training-defined dummy rules; continuous terms use
+`k = 5` basis dimensions with REML smoothness estimation. Counts enter linearly
+on the log1p scale, and documentation is binary. If a continuous variable has
+fewer than five distinct imputed training values it is linear; an unusable or
+constant column is dropped. The source-variable count is separate from the
+`r length(result$full$gam$preprocess$columns)` retained encoded inputs and
+`r length(coef(result$full$gam$model))` fitted regression/spline coefficients.
+
+The ventilation indicator equals 1 when any valid MechVent = 1 is documented in
+24–48 hours. Zero means no such documentation, not proof of no ventilation.
+Its full-cohort documented count is
+`r sum(d$x$MechVent_h24_48_documented_1)` stays. Median imputation is a practical
+way to retain rows, but may blur physiology when measurements are selective.
+
+The following all-Set-A smooths show **centered contributions to the log odds**,
+with approximate 95% pointwise bands and rugs for observed, nonimputed values.
+Zero is a centering constraint, not a clinical threshold, absolute probability
+or odds ratio. The bands are conditional on this formula and imputation procedure;
+they do not capture all selection, missing-data or modeling uncertainty.
+
+```{r}
+#| label: fig-gam-age
+#| fig-width: 8
+#| fig-height: 5
+#| fig-cap: "Age smooth: centered log-odds contribution, pointwise band and observed support."
+plots$effects[[1]]
+```
+
+For age, effective degrees of freedom (EDF) are
+`r fmt(plots$effect_summary[variable=='Age',edf],2)`. The fitted centered contribution
+at the 10th, median and 90th observed percentiles is respectively
+`r paste(fmt(unlist(plots$effect_summary[variable=='Age',.(contribution_q10,contribution_median,contribution_q90)])),collapse=', ')`.
+The age contribution increases almost linearly over the observed range; EDF about
+one provides little evidence of nonlinearity in this fit. This is consistent with
+older age being associated with higher mortality conditional on the other inputs,
+without attributing an intervention effect to age. Bands widen toward younger and
+older extremes, so the fitted slope has less precision there.
+
+```{r}
+#| label: fig-gam-hr
+#| fig-width: 8
+#| fig-height: 5
+#| fig-cap: "Second-window mean heart-rate smooth in original beats/min units."
+plots$effects[[2]]
+```
+
+Heart-rate EDF is `r fmt(plots$effect_summary[variable=='HR_h24_48_mean',edf],2)`.
+The fitted contributions at the 10th, median and 90th percentiles are
+`r paste(fmt(unlist(plots$effect_summary[variable=='HR_h24_48_mean',.(contribution_q10,contribution_median,contribution_q90)])),collapse=', ')`.
+The fitted association increases across the observed range, with modest upward
+curvature rather than a U-shape. EDF about 1.63 suggests limited nonlinearity,
+weaker than for temperature. Higher heart rate can plausibly summarize
+physiological stress, but treatment and case mix may contribute to this
+association. Sparse low/high values have wider bands, limiting tail interpretation.
+
+```{r}
+#| label: fig-gam-temp
+#| fig-width: 8
+#| fig-height: 5
+#| fig-cap: "Second-window mean temperature smooth in original degrees C, zoomed to the observed 1st–99th percentile range; no observations are removed from fitting."
+plots$effects[[3]]
+```
+
+Temperature EDF is `r fmt(plots$effect_summary[variable=='Temp_h24_48_mean',edf],2)`.
+The fitted contributions at the 10th, median and 90th percentiles are
+`r paste(fmt(unlist(plots$effect_summary[variable=='Temp_h24_48_mean',.(contribution_q10,contribution_median,contribution_q90)])),collapse=', ')`.
+The central supported range shows a declining contribution toward a trough near
+37.5 degrees C, followed by an upturn at higher temperatures. EDF about 3.39
+indicates more curvature than age or heart rate. This pattern is compatible with
+temperature departures marking illness, but it is an adjusted predictive
+association. The main view zooms to the observed 1st–99th percentiles; all
+observations remain in fitting. The full-range curve below has a poorly supported
+low-temperature downturn, so a simple U-shape must not be asserted over the entire
+range. Sparse tails, retained soft concerns and wide bands limit clinical reading.
+
+<details>
+<summary>Temperature smooth over the full observed range</summary>
+
+```{r}
+#| label: fig-gam-temp-full
+#| fig-width: 8
+#| fig-height: 5
+#| fig-cap: "Untrimmed temperature range: very sparse low-temperature observations produce large uncertainty."
+plots$temperature_full
+```
+
+The untrimmed curve shows why low-temperature extrapolative-looking shapes need
+caution: its far-left band is much wider than in the densely observed central
+range. The displayed zoom changes only the view, not the data or fitted model.
+
+</details>
+
+```{r}
+#| label: smooth-support
+tab(plots$effect_summary[,.(variable,observed_n,imputed_n,minimum,q10,median,q90,maximum,edf)],digits=2,
+ caption='Table 11. Observed support and fitted EDF for the three displayed smooths.')
+```
+
+The support table quantifies how many original observations versus imputed values
+underlie each fit. The observed range is shown without global winsorization;
+less-supported ranges should carry less interpretive weight.
+
+<details>
+<summary>Convergence and basis-adequacy diagnostics</summary>
+
+```{r}
+#| label: gam-diagnostics
+tab(result$gam_diagnostics,digits=3,caption='Table 12. GAM basis checks for outer fits and all-Set-A refit.')
+```
+
+All fitted GAMs must pass convergence checks. Basis checks use a fixed diagnostic
+seed and 200 permutations. Low k-index p-values, especially with EDF near `k - 1`,
+can indicate inadequate basis size; the prespecified formula is not retuned using
+outer scores. Binary-outcome residual checks and multiple checks warrant caution.
+In this run, full-fit basis p-values are all above 0.05, although temperature EDF
+(3.39 of at most 4) merits attention. Some outer fits have low p-values for BUN
+and lactate, including 0.005 for lactate in fold 5; their EDFs are well below 4.
+These diagnostics remain a methodological limitation rather than grounds for
+outcome-guided formula revisions. Exact formula/fallback records are saved in
+`cp2_gam_terms.csv`.
+
+</details>
+
+Three incorrect extreme OOF GAM probabilities—one death near zero and two
+survivors near one—were driven by the unpenalized dummy for missing Gender.
+That category had only one or two outer-training stays, all with the same outcome,
+in the affected folds. This produced quasi-complete separation and very large
+coefficients despite convergence checks passing. The frozen model and AUROC
+comparison are retained. This is a sparse-category stability and individual-risk
+limitation, rather than an established input or event-coding defect. The category
+coefficient does not establish a causal effect, and saturated fitted probabilities
+must not be equated with reliable clinical risks or clinical certainty.
+
+## 2.6 Model 3: Probability random forest
+
+The `ranger` probability forest uses the same 449 broad candidates, training-only
+median imputation, categorical dummy encoding and usability dropping. It does not
+scale numeric columns. Predictions explicitly extract the column named `1`
+(death), not the survival column. Out-of-bag performance is not used for the
+required common-fold comparison.
+
+The fixed grid has 500 trees, mtry rules `floor(sqrt(p))` and `floor(p/3)` (bounded
+to [1,p] and deduplicated within each training design), and minimum node sizes
+5, 20 and 50. Here p is the retained training design dimension. Settings maximize
+mean three-fold inner AUROC; numerical ties favor larger node size, then smaller
+mtry. Bootstrap sampling with replacement uses fraction 1, Gini splits, one thread,
+fixed seeds and no early stopping. Missing values are explicitly imputed and the
+forest uses `na.action = 'na.fail'` as a safeguard.
+
+```{r}
+#| label: forest-tuning
+tab(result$hyperparameters[family=='forest',.(context,design_p,mtry_rule,mtry,node)],
+ caption='Table 13. Selected forest settings from training-only tuning.')
+```
+
+The table shows which prespecified settings were chosen in each outer fit and,
+if selected as final family, the full-data tuning fit. Full grid results are
+saved in `cp2_tuning_forest.csv`. A training-only 500-tree smoke test took 10.605
+seconds on this development machine before outer evaluation, supporting the
+original grid; this is a recorded development measurement, not a claim about
+runtime on every laptop.
+
+## 2.7 Benchmarks, comparison and final model
+
+SAPS-I and SOFA are used **alone as raw severity scores**, not fitted models,
+model predictors or calibrated probabilities. Their documented `-1` codes map
+to missing in evaluation copies. No logistic calibration or outcome-based
+benchmark imputation is performed.
+
+```{r}
+#| label: benchmark-availability
+bench_counts <- data.table(score=c('SAPS-I','SOFA'),
+ available=c(sum(!is.na(result$oof$SAPS_I_score)),sum(!is.na(result$oof$SOFA_score))),
+ missing=c(sum(is.na(result$oof$SAPS_I_score)),sum(is.na(result$oof$SOFA_score))))
+tab(bench_counts,caption='Table 14. Benchmark availability among all Set A stays.')
+```
+
+The primary five-method comparison uses the same `r sum(comparison$common)`
+score-available stays, with `r sum(d$y[comparison$common])` deaths,
+in the existing outer folds. `r sum(!comparison$common)` stays lack at least one
+benchmark and are excluded from this comparison; every learned-model OOF prediction
+is still retained. The availability table makes the evaluation cohort explicit.
+
+```{r}
+#| label: five-method-comparison
+main <- comparison$summary[,.(Method=method,`Fold 1`=`1`,`Fold 2`=`2`,`Fold 3`=`3`,
+ `Fold 4`=`4`,`Fold 5`=`5`,Mean=mean_auc,SD=sd_auc,Stays=n,Deaths=deaths)]
+tab(main,digits=4,caption='Table 15. Common-cohort fold AUROCs, unweighted mean and sample SD.')
+```
+
+The highest mean AUROC among learned models is for **`r result$selected`**.
+These fold values share assessment stays across methods, enabling a descriptive
+comparison. They remain estimates from overlapping training populations, not five
+independent experiments.
+
+```{r}
+#| label: comparison-denominators
+tab(unique(comparison$fold[,.(fold,n,deaths)]),
+ caption='Table 16. Common comparison denominator and deaths in each outer fold.')
+```
+
+These are the denominators behind every method's fold AUROC in Table 15. This
+prevents a higher score from reflecting a different benchmark-available population.
+
+```{r}
+#| label: fig-five-roc
+#| fig-width: 8
+#| fig-height: 7
+#| fig-cap: "ROC curves for all five methods on aligned OOF predictions/raw benchmark scores."
+plots$roc
+```
+
+The receiver operating characteristic (ROC) curves show discrimination over
+thresholds on the same stays. Pooled AUROCs in the legend summarize aligned OOF
+probabilities and severity scores; they do not replace the mean fold AUROCs in
+the main table. Scores are on different scales, so this is not a comparison of
+calibrated risks or actionable treatment thresholds.
+
+```{r}
+#| label: benchmark-differences
+winner_auc <- comparison$fold[method==result$selected,.(fold,winner_auc=auc)]
+differences <- merge(comparison$fold[method %in% c('SAPS-I','SOFA')],winner_auc,by='fold')
+differences[,difference:=winner_auc-auc]
+difference_summary <- differences[,.(mean_difference=mean(difference),
+ sd_paired_difference=sd(difference),min_difference=min(difference),max_difference=max(difference)),by=method]
+tab(difference_summary,digits=4,caption='Table 17. Descriptive paired fold differences: chosen model minus benchmark.')
+```
+
+Compared with SAPS-I and SOFA, the chosen model's mean differences are
+`r fmt(difference_summary[method=='SAPS-I',mean_difference],4)` and
+`r fmt(difference_summary[method=='SOFA',mean_difference],4)` respectively.
+The corresponding paired-difference SDs are
+`r fmt(difference_summary[method=='SAPS-I',sd_paired_difference],4)` and
+`r fmt(difference_summary[method=='SOFA',sd_paired_difference],4)`.
+Here the mean gains over both raw benchmarks are larger than the corresponding
+paired-difference SDs and than the individual methods' fold SDs. The improvement
+in discrimination is therefore large relative to this observed CV variability,
+but this descriptive comparison is not a significance test or evidence of
+clinical usefulness. Elastic net exceeds forest by only
+`r fmt(comparison$summary[method=="Elastic net",mean_auc]-comparison$summary[method=="Random forest",mean_auc],4)`,
+which is small beside their fold variation; that ranking is not persuasive
+evidence of superiority.
+
+<details>
+<summary>Separate full-cohort learned-model summary</summary>
+
+```{r}
+#| label: full-cohort-models
+tab(comparison$full_models[,.(mean_auc=mean(auc),sd_auc=sd(auc),stays=sum(n),deaths=sum(deaths)),by=method],
+ digits=4,caption='Table 18. Full-cohort learned-model comparison, separate from the common benchmark cohort.')
+```
+
+This table retains all learned-model OOF predictions, including stays without a
+benchmark. Its population differs from Table 15 only when benchmark scores are missing.
+
+</details>
+
+The final family is **`r result$selected`**, selected by highest common-cohort
+mean outer AUROC. Ties within `1e-10` favor elastic net, then GAM, then forest.
+The small lead over forest combines with the elastic net's simpler prediction
+path and readable coefficients to support this choice;
+its ranking alone is not evidence of general superiority. Elastic net provides shrinkage and readable coefficients;
+GAM permits visual nonlinear associations; forest permits flexible interactions
+but has more tuning/computational cost and less direct interpretation.
+
+```{r}
+#| label: final-settings
+hp <- result$bundle$hyperparameters
+tab(data.table(parameter=names(hp),value=vapply(hp,as.character,character(1))),
+ caption='Table 19. Full-data selected-family hyperparameters.')
+```
+
+The selected family is refitted on all Set A using its defined three-fold tuning
+procedure (or fixed REML for GAM), not an average of outer-fold hyperparameters.
+Table 19 gives the actual final settings. All-data elastic net and GAM fits are
+also retained for the required interpretation even if the forest wins.
+
+`output/cp2_final_model.rds` contains the fitted estimator, fitted imputation,
+category fallback, design order, scaling, hyperparameters, event mapping, seeds,
+fold references, package versions and feature-construction specification.
+`cp2_predict()` takes a constructed predictor table and uses saved state without
+outcomes or re-estimating preprocessing. Saved/reloaded predictions agree within
+`1e-12` on a Set-A-derived predictor-only fixture (actual maximum absolute error
+`r fmt(fread('output/cp2_reload_check.csv')$max_absolute_reload_error,12)`).
+
+`output/cp2_oof_predictions.csv` stores one row per stay, outcome, outer fold,
+three OOF mortality-probability columns and two raw severity-score columns.
+Metrics and ROC curves use the newly written OOF CSV as their common evaluation
+source, so the displayed comparison can be recomputed from the saved predictions.
+OOF values are not replaced by all-data fitted probabilities. Applying this
+bundle to another dataset is outside this checkpoint.
+
+## Reproducibility
+
+Run `pixi run --locked checkpoint2` from the repository root with supplied
+Set A inputs. No earlier CP1 run, generated CSV, clinical download or personal
+R library is required. The report fails on R errors, sets fixed seeds, and
+embeds figures/resources. All generated analysis files are written under
+`output/`; only rendered reports are versioned among generated outputs.
+
+The actual runtime/machine log is `output/cp2_runtime.txt`; verification commands,
+exit statuses, numerical checks and rendering diagnostics are documented in
+`docs/cp2-verification.md` and the technical execution record in
+`docs/cp2-submission-readiness.md`.
+
+```{r}
+#| label: warning-audit
+warning_display <- data.table(status=if(length(result$warnings)) 'Captured modeling warning' else 'No R modeling warnings',
+ detail=if(length(result$warnings)) unique(result$warnings) else 'Convergence/path checks passed; basis diagnostics are shown separately.')
+tab(warning_display,caption='Table 20. Modeling warning audit for this execution.')
+```
+
+Warnings are preserved in `cp2_warnings.log`, rather than discarded. The audit
+above reports actual modeling warnings from this run; environment warnings and
+GAM basis limitations are recorded separately in verification and diagnostics.
+
+```{r}
+#| label: session-packages
+packages <- c('data.table','glmnet','mgcv','ranger','pROC','ggplot2','knitr','tidyverse')
+tab(data.table(package=c('R',packages),version=c(as.character(getRversion()),
+ sapply(packages,function(p) as.character(packageVersion(p))))),caption='Table 21. Versions resolved in Pixi.')
+```
+
+These are the versions used in this run. Installed package help, including
+`glmnet` 5.0's control API, was checked during development; the report does not
+claim a development manual proves the installed API. Runtime and changing
+machine/date strings are kept out of this version table.
+
+## References
+
+- Silva I, Moody G, Scott DJ, Celi LA, Mark RG (2012). Predicting in-hospital mortality of ICU patients: the PhysioNet/Computing in Cardiology Challenge 2012. *Computing in Cardiology* 39:245–248. [Paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC3965265/), [dataset and variable definitions](https://physionet.org/content/challenge-2012/1.0.0/), licensed ODC-BY 1.0.
+- Friedman J, Hastie T, Tibshirani R (2010). Regularization paths for generalized linear models via coordinate descent. *Journal of Statistical Software* 33(1). [glmnet methods/documentation](https://glmnet.stanford.edu/articles/glmnet.html).
+- Wood SN (2011). Fast stable restricted maximum likelihood and marginal likelihood estimation of semiparametric generalized linear models. *JRSS B* 73(1):3–36. [mgcv documentation](https://stat.ethz.ch/R-manual/R-devel/library/mgcv/html/gam.html).
+- Wright MN, Ziegler A (2017). ranger: a fast implementation of random forests for high dimensional data in C++ and R. *Journal of Statistical Software* 77(1). [ranger documentation](https://imbs-hl.github.io/ranger/reference/ranger.html).
+- Rozen S (2026). [Checkpoint checklist](https://steverozen.github.io/biostat707_2026/checkpoint2-3-checklist.html), [syllabus sections 9.3, 10 and 11](https://steverozen.github.io/biostat707_2026/), and [reading a centered mgcv smooth](https://steverozen.github.io/biostat707_2026/lectures/w6/w6_reading_centered_smooth.html). Live requirements checked October 10, 2026; checklist publication 2026-10-08 08:10, syllabus publication 2026-10-08 11:24. No substantive change from the supplied brief was found.
