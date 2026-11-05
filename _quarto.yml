@@ -7,3 +7,4 @@ project:
   render:
     - checkpoint1.qmd
     - checkpoint2.qmd
+    - checkpoint3.qmd

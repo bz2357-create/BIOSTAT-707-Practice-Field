@@ -1,0 +1,9 @@
+{
+  "source": "output/cp2_final_model.rds",
+  "sha256": "a7d30c2eb219ba3eb80ec55f37acea7014b1aa0ce588de6ade04d28e255b3556",
+  "source_commit": "ba94fd0b0f9953b21defc593e4273058cb0af124",
+  "training_set": "set-a",
+  "family": "enet",
+  "md5": "670c1fc1fd4a2241fe9ed572ac722019",
+  "audit": "Recursive R object audit excludes patient vectors, tables, IDs and environments; aggregate fitted model/preprocessing only."
+}

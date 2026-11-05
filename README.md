@@ -66,3 +66,37 @@ Checkpoint 2 documents ChatGPT and OpenAI Codex assistance in its opening
 AI-use statement. Its GAM diagnostics include the sparse missing-Gender
 separation limitation. Technical execution and committed-clone evidence are
 recorded through `docs/cp2-submission-readiness.md`.
+
+
+## Checkpoint 3: frozen-model external evaluation
+
+Supply the official `data/set-a/`, `data/set-b/`, `data/set-c/` and
+`data/Outcomes-a.txt`, `data/Outcomes-b.txt`, `data/Outcomes-c.txt`, then run:
+
+```sh
+pixi run --locked checkpoint3
+```
+
+No CP2 training/render command is required. `artifacts/cp2_final_model.rds`
+is the exact frozen CP2 elastic-net model plus fitted preprocessing (its manifest
+records provenance and hashes); `artifacts/cp2-cv-summary.csv` is only the aggregate
+CP2 comparison. CP3 applies saved Set A state, not new B/C imputation or tuning.
+It writes `output/checkpoint3.html` and ignored CP3 prediction/diagnostic files.
+The first complete task took 125.8 seconds (about 2.1 minutes), including data
+construction, 2,000-replicate stratified bootstrap analyses and rendering, on the
+same Darwin arm64 development machine. Final and clean-snapshot timings are in
+`docs/cp3-verification.md`; other platforms are not claimed as executed.
+
+The external adapter audits unlabeled source observations without guessing their
+variable, and resolves duplicate time-zero descriptors by source order while
+preserving every original time-window summary. Raw inputs and CP2 files are
+unchanged. The prespecified review threshold is 20%, DCA range 5%–40%; SOFA's
+separate logistic risk mapping is trained on A only. Calibration regressions
+are diagnostic and never update the frozen prediction rule. Read the report's
+limitations before interpreting risk, subgroup differences or clinical usefulness.
+
+Checks: `pixi run --locked Rscript tests/test-cp3-data.R`,
+`pixi run --locked Rscript tests/test-cp3-metrics.R`,
+`pixi run --locked Rscript tests/test-cp3-analysis.R`,
+`pixi run --locked python tests/test-cp3-report.py`, and
+`pixi run --locked python tests/audit-cp3-frozen.py`.

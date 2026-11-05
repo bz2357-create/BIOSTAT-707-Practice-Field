@@ -30,6 +30,7 @@ r-proc = ">=1.19.1,<2"
 [tasks]
 checkpoint1 = "quarto render checkpoint1.qmd --output-dir output"
 checkpoint2 = "quarto render checkpoint2.qmd --output-dir output"
+checkpoint3 = "quarto render checkpoint3.qmd --output-dir output"
 
 [activation.env]
 OPENBLAS_NUM_THREADS = "1"

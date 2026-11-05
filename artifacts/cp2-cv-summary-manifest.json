@@ -1,0 +1,7 @@
+{
+  "source": "output/cp2_performance.csv",
+  "sha256": "dd02403ef918b48f40bae42be7a4da24975924583aacab090e5ff003afd8d354",
+  "source_commit": "ba94fd0b0f9953b21defc593e4273058cb0af124",
+  "training_set": "set-a",
+  "cohort": "Common benchmark-available Set A cohort; 3733 stays, 520 deaths; mean and sample SD of five outer-fold AUROCs"
+}

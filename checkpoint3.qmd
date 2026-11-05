@@ -1,0 +1,289 @@
+---
+title: "BIOSTAT 707 — Checkpoint 3: Frozen-model evaluation on Sets B and C"
+author: "Bowen Zhang (bz147)"
+engine: knitr
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    embed-resources: true
+    code-fold: true
+execute:
+  echo: false
+  cache: false
+  error: false
+  warning: true
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(data.table);setDTthreads(1)
+library(ggplot2)
+prefix <- normalizePath(Sys.getenv('CONDA_PREFIX'),mustWork=TRUE)
+stopifnot(startsWith(normalizePath(R.home()),paste0(prefix,'/')),
+ all(startsWith(normalizePath(.libPaths()),paste0(prefix,'/'))))
+for(f in c('load-set-a','audit-missingness','build-wide','cp2-data','cp2-preprocess','cp2-models',
+ 'cp3-data','cp3-metrics','cp3-analysis','cp3-run','cp3-plots')) source(paste0('R/',f,'.R'))
+r <- cp3_run();plots <- cp3_plots(r)
+tab <- function(x,...) knitr::kable(x,...)
+fmt <- function(x,d=3) formatC(x,digits=d,format='f')
+```
+
+## AI-use statement
+
+I used ChatGPT and OpenAI Codex for methodological discussion, coding, checking and writing support.
+
+The main advantage was efficiency. AI made it easier to turn a long checklist into a consistent, reproducible evaluation and to develop checks that could be repeated after changes. It also provided another perspective on the analysis: reviewing the code and figures exposed issues that were easy to overlook during implementation. For example, review identified a precision–recall plotting error even though the numerical summary was correct. This showed the value of checking both calculations and their presentation.
+
+The main disadvantage was that plausible code and clear explanations were not always correct. A calibration-code error and the plotting error both required correction. AI could also produce repetitive prose or language that sounded more certain than the evidence justified. Problems such as missing variable labels and an extreme laboratory value required explicit judgment; a successful run alone could not establish that the data or predictions were clinically reliable. Automated checks were useful, but only for the conditions they actually tested.
+
+AI therefore saved time on repetitive work while leaving substantial responsibility for verification and interpretation. I reviewed the report, and the conclusions retain the uncertainty and limitations of the data and model.
+
+## 3.1 Frozen model, data and leakage prevention
+
+This is an external split evaluation of the final **elastic-net logistic regression from Checkpoint 2 (CP2)**. Set A was the development data. Sets B and C were not used to select predictors, imputation values, coefficients, penalties or the review threshold. All three splits come from the same PhysioNet/Computing in Cardiology 2012 intensive care unit (ICU) source; they are held-out data, not independent validation across hospitals or periods. Set C was withheld during the original competition and is now downloadable from the official archive.
+
+```{r}
+#| label: cohort
+tab(r$cohort[,.(split,stays,deaths,death_percent,common_scores,SOFA_available,SAPS_available)],digits=2,caption='Table 1. External cohorts and benchmark-score availability.')
+```
+
+B contains `r r$cohort[split=='B',stays]` stays and `r r$cohort[split=='B',deaths]` deaths (`r fmt(r$cohort[split=='B',death_percent],2)`%); C contains `r r$cohort[split=='C',stays]` stays and `r r$cohort[split=='C',deaths]` deaths (`r fmt(r$cohort[split=='C',death_percent],2)`%). Each stay has one row, with outcomes joined one-to-one by RecordID. No IDs overlap between A, B and C. Header, schema, outcome, time-window and ID checks stop on invalid input.
+
+The predictor window is the first 48 hours, represented by [0,24) and [24,48]. The model is only usable after that **48-hour window**; it is not an admission-time system and does not apply to ICU stays excluded for being shorter than 48 hours. CP1 cleaning, CP2 zero-height/weight rules and deterministic summaries are reused. `Length_of_stay`, `Survival`, RecordID and the outcome never enter the predictor matrix. Simplified Acute Physiology Score I (SAPS-I) and Sequential Organ Failure Assessment (SOFA) remain separate benchmarks.
+
+External source-format exceptions were audited before model performance was examined. B has `r r$cohort[split=='B',descriptor_conflicts]` conflicting time-zero descriptor group(s), including two admission Weight values (70.8 and 70.4). The admission descriptor uses the first source record, consistent with the existing source-order extraction convention; **all original measurements remain in time-window summaries**, including both weights. C has `r r$cohort[split=='C',descriptor_conflicts]` conflicting descriptor group(s). Every conflict is retained in an ignored audit file. This CP3-specific adapter resolves extraction ambiguity without changing CP2 source or fitted preprocessing.
+
+C also contains `r r$cohort[split=='C',untyped_records]` records with a missing variable name across `r r$cohort[split=='C',untyped_stays]` stays; B has `r r$cohort[split=='B',untyped_records]` such records. Their variable identity cannot be recovered reliably, so the adapter preserves them in a source-line audit and excludes them from feature aggregation; it never guesses a variable label. Original input files remain unchanged and all stays are retained. This external format repair may lose clinical information and is an additional validation limitation. The same CP3 adapter is applied to all three sets; on well-formed nonconflicting records it delegates to the unchanged CP2 reader/constructor.
+
+The exact frozen RDS is packaged under `artifacts/` for reproducible execution without rerunning CP2; the original file remains unchanged. Its manifest records the model checksum and provenance. It contains coefficients and fitted preprocessing, with 449 raw inputs and 442 encoded columns. The saved training medians, categorical missing/unseen-level fallback, design order, training means and standard deviations are applied unchanged. The final alpha is 0.5 and lambda is 0.022122162910704492. No model-fitting or tuning function is called to make B/C predictions. Calibration regressions below are diagnostic evaluations, never updates to those predictions.
+
+## 3.2 Discrimination, comparison and precision–recall
+
+Area under the receiver operating characteristic curve (AUROC) uses 1 = in-hospital death and larger risk/score = higher risk. Each external 95% confidence interval (CI) uses 2,000 stay-level bootstrap draws stratified by observed outcome, with fixed seeds. These intervals are conditional on the observed class counts and the already fitted model; they do not include model-development uncertainty. The percentile procedure and number of replicates were fixed before examining external scores.
+
+```{r}
+#| label: discrimination
+tab(r$discrimination[,.(split,method,population,n,deaths,AUROC=auc,lower,upper)],digits=4,
+ caption='Table 2. External AUROC and stratified-bootstrap 95% CIs; raw severity scores are not mortality probabilities.')
+```
+
+The full-cohort model AUROCs are `r fmt(r$discrimination[split=='B' & population=='All stays',auc],4)` on B and `r fmt(r$discrimination[split=='C' & population=='All stays',auc],4)` on C. The three-method comparison uses identical stays with both benchmark scores available within each split; this avoids attributing differences in case availability to performance. All stays retain model predictions, and missing benchmark scores are not imputed with external outcomes.
+
+```{r}
+#| label: cv-comparison
+tab(r$cv_comparison[,.(split,method,cv_n,cv_mean,cv_sd,external_n=n,AUROC=auc,lower,upper)],digits=4,
+ caption='Table 3. CP2 common-cohort five-fold CV mean/sample SD versus external common-cohort AUROC/CI.')
+```
+
+Cross-validation (CV) in CP2 used 3,733 benchmark-available stays/520 deaths; the external denominators are shown explicitly and may differ. The CV standard deviation (SD) is fold-to-fold variation, **not** a CI. For the chosen model, B-minus-CV is `r fmt(r$cv_comparison[split=='B' & method=='Elastic net',auc-cv_mean],4)` and C-minus-CV is `r fmt(r$cv_comparison[split=='C' & method=='Elastic net',auc-cv_mean],4)`. Negative values indicate a lower external estimate; positive values do not support observed optimism in that comparison. Selecting a family on the same outer CV still introduces possible selection optimism, and a single held-out split cannot establish that CV is unbiased.
+
+```{r}
+#| label: auc-difference
+tab(r$difference,digits=4,caption='Table 4. Set B minus Set C model AUROC; independent split-bootstrap difference CIs.')
+```
+
+For all stays, the B–C difference CI `r if(r$difference[population=='All stays',lower]>0 || r$difference[population=='All stays',upper]<0) 'excludes' else 'includes'` zero. Thus `r if(r$difference[population=='All stays',lower]>0 || r$difference[population=='All stays',upper]<0) 'the observed difference is larger than expected from this sampling variation alone, subject to the bootstrap assumptions' else 'chance sampling variation is a plausible explanation for the observed difference'`. This conclusion uses the CI of the difference, not overlap of the two separate CIs; patient independence remains an assumption.
+
+```{r}
+#| label: fig-pr
+#| fig-width: 9
+#| fig-height: 6
+#| fig-cap: "Set B precision–recall curve with the observed death-rate baseline."
+plots$pr
+```
+
+Precision is positive predictive value (PPV), and recall is sensitivity. The death-rate baseline is `r fmt(r$pr$prevalence,4)`; average precision is `r fmt(r$pr$average_precision,4)`, calculated as the sum of precision multiplied by each recall increment after grouping tied risks (not trapezoidal interpolation). Deaths are a minority, so this plot shows how many flagged patients die while sensitivity changes; AUROC alone can obscure the burden of false positives. Precision generally declines as more lower-risk patients are included. The artificial starting point (recall 0, precision 1) is a plotting convention, not a useful operating point.
+
+## 3.3 Calibration and overall prediction error
+
+Calibration checks whether predicted risks agree with observed frequencies. Calibration-in-the-large is the intercept from logistic regression of death on a fixed offset `logit(p)`; 0 is ideal, positive means underprediction and negative means overprediction. The calibration slope comes from logistic regression on `logit(p)` with a freely estimated intercept; 1 is ideal, below 1 indicates overly extreme risks, above 1 overly timid risks. The fits are diagnostic and do not recalibrate or refit the frozen model.
+
+```{r}
+#| label: calibration-summary
+tab(r$calibration_summary[,.(split,n,deaths,prevalence,mean_risk,intercept,intercept_lower,intercept_upper,slope,slope_lower,slope_upper,brier,scaled_brier,clipped)],digits=4,
+ caption='Table 5. Calibration intercept/slope with approximate Wald 95% intervals, Brier and scaled Brier scores.')
+```
+
+The Brier score is mean squared probability error; smaller is better. The **scaled Brier** is `1 - Brier/[prevalence × (1 − prevalence)]`; larger is better, 0 matches the constant prevalence forecast for that evaluation population and a negative value is worse. This prevalence-normalized descriptive reference is not a fitted deployment comparator. Logit inputs alone are clipped at `1e-8` and `1-1e-8` if necessary (counts in the table); probabilities used for scores, thresholds and decision curves are unchanged.
+
+```{r}
+#| label: fig-calibration-b
+#| fig-width: 9
+#| fig-height: 6
+#| fig-cap: "Set B flexible calibration diagnostic, pointwise confidence band, ideal diagonal and predicted-risk rug."
+plots$calibration_B
+```
+
+```{r}
+#| label: fig-calibration-c
+#| fig-width: 9
+#| fig-height: 6
+#| fig-cap: "Set C calibration diagnostic on the same probability axes."
+plots$calibration_C
+```
+
+Each curve is a logistic generalized additive model (GAM) smoother of the outcome on logit predicted risk, with basis size 5 and restricted maximum likelihood (REML). The curve is displayed against the original predicted risk; it is more flexible than a single intercept/slope or binned deciles. Approximate 95% pointwise bands use the fitted coefficient covariance conditional on estimated smoothness; they are not simultaneous bands or complete uncertainty about development. The rug below the curve shows where risks are supported. Sparse high-risk tails deserve less weight. No Hosmer–Lemeshow test is used.
+
+```{r}
+#| label: calibration-regions
+regions <- rbindlist(lapply(c('b','c'),function(s) rbindlist(lapply(c(.1,.2,.4),function(target) {
+ z <- r$calibration[[s]]$curve;i <- which.min(abs(z$p-target))
+ data.table(split=toupper(s),target_risk=target,grid_risk=z$p[i],smoothed_observed=z$fit[i],observed_minus_predicted=z$fit[i]-z$p[i],lower=z$lower[i],upper=z$upper[i])
+}))))
+tab(regions,digits=3,caption='Table 6. Local calibration at grid points nearest 10%, 20% and 40% predicted risk.')
+```
+
+For B the intercept is `r fmt(r$calibration$b$summary$intercept)` and slope is `r fmt(r$calibration$b$summary$slope)`; for C they are `r fmt(r$calibration$c$summary$intercept)` and `r fmt(r$calibration$c$summary$slope)`. The intercepts suggest `r if(r$calibration$b$summary$intercept>0) 'average underprediction' else 'average overprediction'` on B and `r if(r$calibration$c$summary$intercept>0) 'average underprediction' else 'average overprediction'` on C. Both intercept CIs include zero, so these small average-underprediction point estimates do not establish an overall offset. Slopes `r if(all(r$calibration_summary$slope<1)) 'below one indicate that the overall risk spread is too extreme in both splits' else if(all(r$calibration_summary$slope>1)) 'above one indicate that risks are too compressed (too timid) overall in both splits; both slope intervals also lie above one in this run' else 'differ in direction between the two splits and must be interpreted separately against the ideal of one'`. Table 6 locates deviations on the risk scale: positive observed-minus-predicted values mean underprediction, negative values overprediction. Here the 20% and 40% neighborhoods show underprediction on both splits, while low-risk behavior and sparse extreme tails differ. These local results and uncertainty qualify any global conclusion; an intercept near zero does not rule out local miscalibration.
+
+## 3.4 Decision curves and the prespecified clinical use
+
+The proposed use is a **research-only prompt for clinician review after 48 hours**, when predicted death risk is at least **20%**. It must not trigger automatic treatment limitation, denial of care or a goals-of-care decision. This threshold was chosen before external performance to illustrate a review policy, not optimized to maximize an external score. A 20% threshold implies that missing a death receives four times the weight of an unnecessary flag in the decision-curve trade-off; whether that trade-off fits a real review workflow is not established.
+
+Decision curve analysis (DCA) computes net benefit `TP/n − FP/n × threshold/(1−threshold)`. Treat-none has zero net benefit and treat-all follows observed prevalence. The threshold range 5%–40% was prespecified. Outcomes reflect existing care; the curves do not demonstrate that an intervention caused benefit.
+
+```{r}
+#| label: sofa-mapping
+tab(data.table(intercept=r$sofa_mapping$coefficients[1],slope=r$sofa_mapping$coefficients[2],training_stays=r$sofa_mapping$n,training_deaths=r$sofa_mapping$deaths),digits=4,
+ caption='Table 7. Prespecified SOFA-to-risk logistic mapping fitted only on Set A.')
+```
+
+Raw SOFA is not a probability, so its decision curve uses `logit(risk) = intercept + slope × SOFA` fitted only on A, then frozen for B/C. This is a separate benchmark mapping, not a refit of the CP2 model; it assumes a linear logit association and may itself miscalibrate externally. All DCA strategies use the same SOFA-available patients within each split, whose counts appear in Table 1. Table 2 still evaluates untransformed SOFA for discrimination.
+
+```{r}
+#| label: fig-dca-b
+#| fig-width: 9
+#| fig-height: 6
+#| fig-cap: "Set B decision curves over the prespecified 5%–40% range; no outcome-based threshold selection."
+plots$dca_B
+```
+
+```{r}
+#| label: fig-dca-c
+#| fig-width: 9
+#| fig-height: 6
+#| fig-cap: "Set C decision curves with the same frozen model and A-only SOFA mapping."
+plots$dca_C
+```
+
+```{r}
+#| label: dca-threshold
+tab(r$dca[abs(threshold-.2)<1e-10,.(split,method,n,net_benefit)],digits=4,caption='Table 8. Net benefit at the agreed 20% threshold, on the matched DCA cohorts.')
+```
+
+Higher curves indicate greater estimated net benefit under the stated trade-off. At 20%, model net benefit is `r fmt(r$dca[split=='B' & method=='Model' & abs(threshold-.2)<1e-10,net_benefit],4)` on B and `r fmt(r$dca[split=='C' & method=='Model' & abs(threshold-.2)<1e-10,net_benefit],4)` on C. Compare these with SOFA, treat-all and zero in Table 8 rather than claiming dominance over the entire plotted range. These are point estimates without DCA confidence bands; small separations are not evidence of reliable superiority.
+
+```{r}
+#| label: clinical-threshold
+tab(r$thresholds,digits=4,caption='Table 9. Full-cohort operating characteristics at risk >=20%; event 1 = min(sensitivity, PPV).')
+```
+
+The model flags `r fmt(r$thresholds[split=='B',flagged_per_100],1)` per 100 B patients and `r fmt(r$thresholds[split=='C',flagged_per_100],1)` per 100 C patients. B sensitivity/PPV are `r fmt(r$thresholds[split=='B',sensitivity])`/`r fmt(r$thresholds[split=='B',PPV])`; C values are `r fmt(r$thresholds[split=='C',sensitivity])`/`r fmt(r$thresholds[split=='C',PPV])`. The Challenge event 1 score is `r fmt(r$thresholds[split=='B',event1])` on B and `r fmt(r$thresholds[split=='C',event1])` on C. Many flagged patients survive, while some deaths remain below threshold; staffing capacity and the consequences of both errors matter. This full-cohort table and the SOFA-available DCA table have intentionally different denominators, both labeled.
+
+## 3.5 Subgroups on Set B
+
+Age bands (<65, 65–79, >=80 years), recorded sex (0 female, 1 male, unknown) and ICU types (1 coronary care, 2 cardiac surgery recovery, 3 medical, 4 surgical, unknown) were fixed before subgroup performance. Each row reports stays and deaths, AUROC with stratified-bootstrap CI, and calibration-in-the-large with a Wald CI. Unknown groups appear only when present.
+
+```{r}
+#| label: subgroups
+tab(r$subgroups,digits=3,caption='Table 10. Set B subgroup discrimination and calibration; small_group flags fewer than 20 deaths or survivors.')
+```
+
+Differences large enough to affect flagged workload or risk interpretation warrant attention, but neither apparent ordering nor a nominal CI establishes a reliable subgroup effect. Inspect calibration departures together with the AUROC intervals, denominators and events. ICU groups differ in case mix and monitoring; this is not a causal effect of unit assignment. In this run, medical ICU discrimination (about 0.803) is lower than surgical ICU discrimination (about 0.878); that 0.075 gap warrants attention but is not an adjusted causal or multiplicity-corrected finding. The cardiac-surgery calibration intercept is about -0.67, indicating overprediction in that group, whereas the medical-ICU intercept is about +0.19. These offsets may matter for workload and risk communication even when ranking is acceptable. Unknown sex has only five stays and no deaths, so AUROC and intercept are not estimable. There are multiple overlapping subgroup comparisons, and no multiplicity-adjusted claim or model revision is made. Undefined/unstable estimates are labeled rather than silently assigning a score.
+
+## 3.6 Model interpretation and causality
+
+The final model is regression, so standardized coefficients describe its prediction rule directly. A positive coefficient increases the fitted log odds conditional on other encoded predictors; a negative coefficient decreases it. The scale is one **Set A training SD**, including dummy columns: one SD for a dummy is not a complete category contrast. Correlated summaries can substitute for each other; coefficient size is neither independent importance nor causal influence.
+
+```{r}
+#| label: fig-coefficients
+#| fig-width: 9
+#| fig-height: 8
+#| fig-cap: "Largest absolute standardized coefficients of the unchanged CP2 elastic-net model."
+plots$coefficients
+```
+
+The plot shows 25 coefficients, excluding the intercept; the full table follows. Shrinkage and correlated features limit mechanistic conclusions. 
+
+<details><summary>Complete frozen coefficient table</summary>
+
+```{r}
+#| label: full-coefficients
+tab(r$coefficients,digits=5,caption='Table 11. All frozen encoded coefficients, including zero coefficients.')
+```
+
+The full table makes the plotted truncation explicit and shows which encoded inputs have nonzero coefficients.
+
+</details>
+
+```{r}
+#| include: false
+monitor <- r$coefficients[grepl('_count$',predictor) & abs(coefficient)>1e-8][order(-abs(coefficient))][1]
+```
+
+For example, `r monitor$predictor` has coefficient `r fmt(monitor$coefficient)`. This measurement-count feature can reflect how clinicians monitor a sick patient, treatment decisions, selective measurement and underlying severity. Its association does not imply that ordering fewer or more measurements would change mortality. The model also lacks many reasons for treatment, comorbidities and later clinical changes; those omissions can distort apparent physiological associations.
+
+## 3.7 Ten Set B errors and their drivers
+
+Five highest-risk survivors and five lowest-risk deaths are selected by frozen risk, breaking ties by RecordID. Anonymous labels are used below; patient IDs and full per-patient outputs stay in ignored local files. A high-risk survivor and low-risk death are discordant outcomes, not necessarily proof that the predicted probability was wrong: an individual outcome cannot verify a probability.
+
+```{r}
+#| label: case-overview
+tab(r$cases[,.(case,outcome,risk,Age,Gender,ICUType,missing_fraction,hard_invalid,untyped_records,data_review_flag)],digits=3,
+ caption='Table 12. Selected discordant outcomes; missingness is across constructed predictor inputs before imputation.')
+```
+
+These cases characterize both tails. Heavy missingness or invalid source records can raise data concerns, but a count alone cannot establish that a data problem caused the error. A survivor may have received effective treatment; a later death may reflect an unrecorded change after 48 hours. These are plausible explanations, not observed causal histories.
+
+```{r}
+#| label: case-drivers
+tab(r$cases[,.(case,top_contributions,judgment)],caption='Table 13. Five largest absolute signed log-odds contributions for each selected case and cautious error assessment.')
+```
+
+In Survivor-1, WBC_h24_48_max is 12,500 in the source units and contributes about +35 log-odds units by itself, producing a saturated predicted risk despite survival. This warrants investigation of scale, units or data entry rather than attributing certainty to the model. Its provenance cannot be resolved from these records alone, so the value is retained and no guessed correction is applied. A diagnostic flag also marks any single contribution exceeding 5 absolute log-odds units; this flag is not a clinical validity bound and does not change predictions. The lowest-risk death is young with relatively reassuring recorded physiology; the model cannot observe all later causes of deterioration.
+
+Each driver includes its pre-imputation raw input and signed contribution after saved encoding/scaling. Missing raw values use Set A fitted imputation/fallback. Positive contributions push risk up and negative contributions push down. For **each** case, Table 13 records whether observed missingness/quality raises concern or whether model overlap/unobserved course remains plausible. Neither contribution magnitude nor the displayed source values prove a specific cause. The decomposition is additive, not SHAP, and not a counterfactual explanation.
+
+```{r}
+#| label: reconstruction
+tab(r$cases[,.(case,intercept,all_contributions_sum,reconstructed_probability=plogis(intercept+all_contributions_sum),saved_probability=risk)],digits=5,
+ caption='Table 14. Intercept plus all signed contributions reconstructs the saved-model probability.')
+```
+
+Reconstruction is checked within `1e-10`; using all contributions is essential because only five per case are shown above. This verifies explanation arithmetic without implying that a clinical intervention on a term would produce that risk change.
+
+## 3.8 Clinical usefulness, limitations and reproducibility
+
+I would **not recommend deployment for clinical decisions on this evidence alone**. Discrimination and the descriptive decision curves can support further evaluation of a clinician-review prompt, but calibration, false-positive workload, missed deaths and intervention consequences must be assessed prospectively. Table 9 quantifies workload at the prespecified threshold; Table 8 quantifies the assumed trade-off on matched cohorts. They do not establish actual benefit, safety or an optimal clinical threshold. A review prompt itself consumes resources, so its net-benefit assumptions require stakeholder input.
+
+Limitations include a single historical data source, selection of ICU stays lasting at least 48 hours, a 48-hour delay in availability, missing and implausible measurements, selective monitoring/treatment, absent clinical context and post-window information, and internal-split rather than transport validation. CP2 model-family selection can make its CV estimate optimistic. Bootstrap CIs condition on the frozen model and class counts; subgroup comparisons are numerous; diagnostic calibration bands are approximate; decision curves have no uncertainty bands. No predictor is interpreted as an intervention effect. CP2's separate GAM had sparse-category separation; the frozen final model evaluated here is elastic net, so that GAM was not substituted or retrained.
+
+Leakage could enter through rebuilding medians/scales on B/C, selecting a new model or threshold from their outcomes, putting severity scores/outcomes/IDs into the design, or replacing OOF CV predictions with fitted A risks. The pipeline uses the frozen saved preprocessing/model, a positive predictor allowlist, pre-agreed evaluation choices and the archived aggregate CP2 CV table. SOFA's separate risk mapping is fitted only on A. Calibration fits diagnose external outcomes but are not fed back into predictions. Reproducibility is not evidence that the model is clinically valid.
+
+Run **`pixi run --locked checkpoint3`** with the supplied `data/set-a`, `data/set-b`, `data/set-c` and corresponding outcomes. It loads the packaged frozen model and aggregate CP2 CV summary, needs no CP2 rerun, and writes only CP3-prefixed analysis artifacts under `output/` plus `output/checkpoint3.html`. It never downloads data while rendering. Original CP1/CP2 reports, saved model and preprocessing are checked separately against protected hashes. Patient exports, model diagnostics and the result RDS remain ignored; only the report and approved code/aggregate artifacts are intended for version control. Execution evidence and actual runtime are recorded in `docs/cp3-verification.md` and `output/cp3_*` logs.
+
+```{r}
+#| label: warnings
+tab(data.table(status=if(length(r$warnings)) 'Analysis warning' else 'No R analysis warnings',detail=if(length(r$warnings)) r$warnings else 'Diagnostic estimates still require interpretation; absence of warnings does not establish validity.'),
+ caption='Table 15. Analysis warning audit for this execution.')
+```
+
+The warning audit reports actual conditions retained from analysis; environment/Quarto notices and test failures corrected during development are documented separately. No warning is taken as a substitute for inspecting calibration or subgroup support.
+
+```{r}
+#| label: packages
+packages <- c('data.table','glmnet','mgcv','pROC','ggplot2','knitr')
+tab(data.table(package=c('R',packages),version=c(as.character(getRversion()),sapply(packages,function(p) as.character(packageVersion(p))))),
+ caption='Table 16. Versions used in the locked R environment.')
+```
+
+Table 16 records the package versions used. Execution was tested on macOS with Apple Silicon; the other platforms in the lock file were not tested.
+
+## References
+
+- Silva I, Moody G, Scott DJ, Celi LA, Mark RG (2012). Predicting in-hospital mortality of ICU patients: the PhysioNet/Computing in Cardiology Challenge 2012. [Official dataset and definitions](https://physionet.org/content/challenge-2012/1.0.0/); [official download directory](https://physionet.org/files/challenge-2012/1.0.0/). Local provenance manifest records downloaded URLs and observed SHA-256 fingerprints, not publisher-supplied checksums.
+- Rozen S (2026). Supplied Checkpoint 3 checklist and [Evaluating clinical prediction models, part 1](https://steverozen.github.io/biostat707_2026/lectures/w9/w9_evaluation_1.html): calibration intercept, slope and flexible curve. Course materials distinguish diagnostic calibration from updating a predictor.
+- Robin X et al. (2011). pROC: an open-source package for R and S+ to analyze and compare ROC curves. BMC Bioinformatics 12:77. [Package methods](https://xrobin.github.io/pROC/).
+- Wood SN. mgcv documentation: [prediction and standard errors](https://stat.ethz.ch/R-manual/R-devel/library/mgcv/html/predict.gam.html). The installed package, not a newer manual alone, determines executed behavior.
