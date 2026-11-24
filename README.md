@@ -1,4 +1,16 @@
-# BIOSTAT 707 Checkpoints 1 and 2
+# BIOSTAT 707 — Checkpoints 1–3
+
+## Read the reports
+
+Download an HTML report below and open the saved file in your browser. Each report includes its figures and tables and can be read offline. R, Pixi and the patient data are only needed to reproduce the analysis.
+
+| Checkpoint | Report | Quarto source |
+| --- | --- | --- |
+| 1 · Set A cohort, data quality and missing measurements | [Download CP1 report (HTML)](https://github.com/bz2357-create/BIOSTAT-707-Practice-Field/releases/download/checkpoint-reports-d340477/checkpoint1.html) | [CP1 source](checkpoint1.qmd) |
+| 2 · Model development and cross-validation on Set A | [Download CP2 report (HTML)](https://github.com/bz2357-create/BIOSTAT-707-Practice-Field/releases/download/checkpoint-reports-d340477/checkpoint2.html) | [CP2 source](checkpoint2.qmd) |
+| 3 · Evaluation of the frozen model on Sets B and C | [Download CP3 report (HTML)](https://github.com/bz2357-create/BIOSTAT-707-Practice-Field/releases/download/checkpoint-reports-d340477/checkpoint3.html) | [CP3 source](checkpoint3.qmd) |
+
+## Reproduce Checkpoints 1 and 2
 
 With Pixi installed and the supplied files in `data/set-a/` and
 `data/Outcomes-a.txt`, run from the repository root:
