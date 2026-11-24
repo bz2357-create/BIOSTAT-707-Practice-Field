@@ -2216,9 +2216,9 @@ vertical-align: -.125em;
 <section id="ai-use-statement" class="level2">
 <h2 class="anchored" data-anchor-id="ai-use-statement">AI-use statement</h2>
 <p>I used ChatGPT and OpenAI Codex for methodological discussion, coding, checking and writing support.</p>
-<p>The main advantage was efficiency. AI made it easier to turn a long checklist into a consistent, reproducible evaluation and to develop checks that could be repeated after changes. It also provided another perspective on the analysis: reviewing the code and figures exposed issues that were easy to overlook during implementation. For example, review identified a precision–recall plotting error even though the numerical summary was correct. This showed the value of checking both calculations and their presentation.</p>
-<p>The main disadvantage was that plausible code and clear explanations were not always correct. A calibration-code error and the plotting error both required correction. AI could also produce repetitive prose or language that sounded more certain than the evidence justified. Problems such as missing variable labels and an extreme laboratory value required explicit judgment; a successful run alone could not establish that the data or predictions were clinically reliable. Automated checks were useful, but only for the conditions they actually tested.</p>
-<p>AI therefore saved time on repetitive work while leaving substantial responsibility for verification and interpretation. I reviewed the report, and the conclusions retain the uncertainty and limitations of the data and model.</p>
+<p>AI saved me time when I needed to repeat the same checks on Sets B and C. Reviewing the precision–recall figure alongside its numerical summary paid off. Average precision was correct, but the plotted steps gave the wrong impression when patients had tied risks. Checking the number alone would have missed the problem.</p>
+<p>One limitation showed up in the calibration code. It worked on the full cohorts but failed for a subgroup with just one observation. A test for that case caught a problem that the full-cohort results had hidden. The case review raised a different issue. One white blood cell measurement was large enough to drive a prediction almost to certainty. The code could show how much that value contributed, but the record could not tell us whether its units were correct.</p>
+<p>I reviewed the final report with those examples in mind. I kept the unusual value visible and described what it did to the prediction. Assigning a corrected value would have required information I did not have.</p>
 </section>
 <section id="frozen-model-data-and-leakage-prevention" class="level2">
 <h2 class="anchored" data-anchor-id="frozen-model-data-and-leakage-prevention">3.1 Frozen model, data and leakage prevention</h2>
@@ -2851,7 +2851,7 @@ Figure 5: Set C decision curves with the same frozen model and A-only SOFA mapp
 </table>
 </div>
 </div>
-<p>Higher curves indicate greater estimated net benefit under the stated trade-off. At 20%, model net benefit is 0.0659 on B and 0.0620 on C. Compare these with SOFA, treat-all and zero in Table 8 rather than claiming dominance over the entire plotted range. These are point estimates without DCA confidence bands; small separations are not evidence of reliable superiority.</p>
+<p>Higher curves indicate greater estimated net benefit under the stated trade-off. At 20%, model net benefit is 0.0659 on B and 0.0620 on C. At that threshold the model had higher estimated net benefit than SOFA, flagging everyone, or flagging no one in both cohorts (Table 8). The curves have no confidence bands, so the uncertainty around these differences is unknown.</p>
 <div class="cell">
 <div class="cell-output-display">
 <table class="caption-top table table-sm table-striped small">
@@ -3099,7 +3099,7 @@ Figure 5: Set C decision curves with the same frozen model and A-only SOFA mapp
 </table>
 </div>
 </div>
-<p>Differences large enough to affect flagged workload or risk interpretation warrant attention, but neither apparent ordering nor a nominal CI establishes a reliable subgroup effect. Inspect calibration departures together with the AUROC intervals, denominators and events. ICU groups differ in case mix and monitoring; this is not a causal effect of unit assignment. In this run, medical ICU discrimination (about 0.803) is lower than surgical ICU discrimination (about 0.878); that 0.075 gap warrants attention but is not an adjusted causal or multiplicity-corrected finding. The cardiac-surgery calibration intercept is about -0.67, indicating overprediction in that group, whereas the medical-ICU intercept is about +0.19. These offsets may matter for workload and risk communication even when ranking is acceptable. Unknown sex has only five stays and no deaths, so AUROC and intercept are not estimable. There are multiple overlapping subgroup comparisons, and no multiplicity-adjusted claim or model revision is made. Undefined/unstable estimates are labeled rather than silently assigning a score.</p>
+<p>Medical ICU discrimination (about 0.803) is lower than surgical ICU discrimination (about 0.878); the units also differ in case mix and monitoring. The cardiac-surgery calibration intercept is about -0.67, indicating overprediction in that group, whereas the medical-ICU intercept is about +0.19. These offsets may matter for workload and risk communication even when ranking is acceptable. Unknown sex has only five stays and no deaths, so AUROC and intercept are not estimable. There are multiple overlapping subgroup comparisons, and no multiplicity-adjusted claim or model revision is made. </p>
 </section>
 <section id="model-interpretation-and-causality" class="level2">
 <h2 class="anchored" data-anchor-id="model-interpretation-and-causality">3.6 Model interpretation and causality</h2>
@@ -5320,7 +5320,7 @@ Complete frozen coefficient table
 <li>Silva I, Moody G, Scott DJ, Celi LA, Mark RG (2012). Predicting in-hospital mortality of ICU patients: the PhysioNet/Computing in Cardiology Challenge 2012. <a href="https://physionet.org/content/challenge-2012/1.0.0/">Official dataset and definitions</a>; <a href="https://physionet.org/files/challenge-2012/1.0.0/">official download directory</a>. Local provenance manifest records downloaded URLs and observed SHA-256 fingerprints, not publisher-supplied checksums.</li>
 <li>Rozen S (2026). Supplied Checkpoint 3 checklist and <a href="https://steverozen.github.io/biostat707_2026/lectures/w9/w9_evaluation_1.html">Evaluating clinical prediction models, part 1</a>: calibration intercept, slope and flexible curve. Course materials distinguish diagnostic calibration from updating a predictor.</li>
 <li>Robin X et al. (2011). pROC: an open-source package for R and S+ to analyze and compare ROC curves. BMC Bioinformatics 12:77. <a href="https://xrobin.github.io/pROC/">Package methods</a>.</li>
-<li>Wood SN. mgcv documentation: <a href="https://stat.ethz.ch/R-manual/R-devel/library/mgcv/html/predict.gam.html">prediction and standard errors</a>. The installed package, not a newer manual alone, determines executed behavior.</li>
+<li>Wood SN. mgcv documentation: <a href="https://stat.ethz.ch/R-manual/R-devel/library/mgcv/html/predict.gam.html">prediction and standard errors</a>.</li>
 </ul>
 </section>
 
